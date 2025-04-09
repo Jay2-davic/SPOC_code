@@ -3,7 +3,7 @@ Author: Jay Jimenez jimenez45@llnl.gov
 
 # Project Description
 
-The SPOC project aims to establish an automated, high-throughput experimentation workflow to screen solid state polymer electrolytes. This repository contains code to reproduce the data cleaning workflow and data processing for the SPOC project. Electrochemical impedance spectroscopy processing code is included as a Python file which was used to determine bulk ionic conductivities.
+The SPOC project aims to establish an automated, high-throughput experimentation workflow to screen solid state polymer electrolytes. This repository contains code to reproduce the data cleaning workflow, data processing, and active learning for the SPOC project. Electrochemical impedance spectroscopy processing code is included as a Python file which was used to determine bulk ionic conductivities.
 
 ## License
 

@@ -1,0 +1,3 @@
+[submodule "active_learning"]
+	path = active_learning
+	url = https://github.com/junhyug/SPOC_active_learning.git
