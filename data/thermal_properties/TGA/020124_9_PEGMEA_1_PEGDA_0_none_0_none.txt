@@ -1,0 +1,77 @@
+[File Parameters]
+Run date	2/1/2024 5:23:28 PM
+Trios version	5.5.0.323
+Original File Name	C:\Users\Public\Documents\TGA DATA\Silverman1\PegdaPegmea.tri
+Current File Name	C:\Users\jimenez45\OneDrive - LLNL\General - High-Throughput Polymer Electrolytes DIW\Silverman - Teams Files\TGA_Files\Silverman1\PegdaPegmea.tri
+[Procedure]
+Procedure Name	
+Sample Name	PegdaPegmea
+Pan Number	20
+Sample Mass	12.469 mg
+Pan Type	Platinum (100 uL)
+Comments	Pan Weight: 54.8mg 
+Sample Weight: 11.5mg
+Lid w/ Pinhole
+Project Name	
+Operator	MFS
+Test	Custom
+Skip Weight Stabilization	False
+Sample mass pre-weigh	Not Available
+Stop on Gas Flow Error	No
+[Signal List]
+Signal #1	Time (min)
+Signal #2	Temperature (°C)
+Signal #3	Weight (mg)
+Signal #4	Temperature Difference (°C)
+Signal #5	Sample Purge (mL/min)
+Signal #6	Balance Purge (mL/min)
+Signal #7	Set Point Temperature (°C)
+Signal #8	Power Delivered (W)
+Signal #9	Ramp Rate (°C/min)
+[Configuration]
+Company Name	LLNL
+Instrument Name	5500-0748
+Instrument Type	TGA5500
+Serial Number	5500-0748
+IP	10.248.120.5
+Location of Instrument	Lab
+DisplayType	TianmaV2
+Sample Interval 	0.1 s/pt
+Gas 1	Nitrogen
+Gas 2	Nitrogen
+Selected Gas Channel	1
+MTGA HiRes Licensed	Yes
+[Versions]
+Common IDD Version	1
+Cortex Version	VER 2.1.2.69
+Driver	5.0.0.7
+GDM Version	1.2.1.2
+TouchscreenVersion	1.0.3.1805
+PCU Version	1.2.0.22
+Transducer Version	1.1.0.32
+[Experiment Logs]
+Experiment Log Entry # 1	Ramp Segment 10 C/min to 500 C Started
+Experiment Log Entry # 3	Isothermal Segment 10 min started
+[Method Log]
+Method Log Entry # 1	(Ramp 5991) Ramp 10 °C/minute to 500 °C
+Method Log Entry # 2	Isothermal 10 minutes
+[Weight Calibration]
+Date Applied	7/20/2023 12:04:28 PM
+Empty Pan Weight	0.000 mg
+Low Reference Weight	100.000 mg
+High Reference Weight	1,000.000 mg
+Low Gain Meter Reading	1.0306E-005 mg/count
+High Gain Meter Reading	8.2047E-005 mg/count
+Low Meter Offset	46.0764 mg
+High Meter Offset	646.7731 mg
+[Curie Calibration]
+Date Applied	7/20/2023 1:28:07 PM
+Description	From 256.940 °C to 456.940 °C at 20.000°C/min
+Gas Type	Nitrogen
+Pan Type	Platinum (100 uL)
+Source Files 1	C:\Users\wells54\Desktop\PMV 20July2023\Nickel Calibration.tri
+Source Files 2	C:\Users\wells54\Desktop\PMV 20July2023\Alumel Calibration.tri
+Measured 1	160.9307
+Known 1	154.16
+Measured 2	354.4552
+Known 2	356.94

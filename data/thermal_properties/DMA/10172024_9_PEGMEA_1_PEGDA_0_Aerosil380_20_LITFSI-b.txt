@@ -1,0 +1,59 @@
+[File Parameters]
+Name	10172024_PEGDA_PEGMEA_0_Aerosil380_20_LITFSI-b
+Instrument type	DMA850
+Instrument serial number	0850-00515
+Instrument name	DMA0850-00515
+Instrument location	LAB
+Company name	LLNL
+Trios version	5.5.0.323
+File name	C:\Users\DSC\Desktop\Johanna Schwartz\SPOC SPEs\mechanical test - PEGDAPEGMEA no aer380 20percent LITFSI.tri
+Run date	10/7/2024 12:50:35 PM
+Preload Direction	-1.00000
+Starting Force	0.0100000
+Starting Displacement	9389.04
+Time at start of test	4.58557
+[Clamp Parameters]
+Geometry Type	Compression Clamp
+Name	Compression Clamp
+Thickness	1.50924 mm
+Diameter	8.5 mm
+Notes	
+[Clamp Extended Parameters]
+Clamp mass	37.55 g
+Clamp compliance	1.03812 µm/N
+Stress constant	7521.44 Pa/N
+Strain constant	662.587 1/m
+Reference position	3.285 mm
+Zero reference position	3.285 mm
+Tool mass calibration date	10/7/2024
+Compliance calibration date	10/7/2024
+Use constant volume (true stress/strain)	Disabled
+Reference Volume	0.0856416 mL
+[Firmware Versions]
+InfoVerDsp	V2019.12.12
+InfoVerWinCe	V2021.8.30
+InfoVerDmaIface14	V2019.9.19
+InfoVerDmaPower15	V2017.8.9
+[Calibration Date Information]
+InfoDateDynPhase	12/2/2022 10:23 AM
+InfoDateStaticNrm	12/2/2022 9:57 AM
+InfoDateTorqLag	12/2/2022 12:15 PM
+InfoDateMotorScale	12/2/2022 12:49 PM
+InfoDateADGain	12/2/2022 11:53 AM
+InfoDateInertiaPhase	12/2/2022 10:03 AM
+InfoDateInertiaMass	4/7/2022 3:13 PM
+InfoDateShaftMass	7/29/2020 5:23 AM
+InfoDateDmaForcePosn	7/29/2020 7:04 AM
+InfoDateDmaEncoderCorr	7/29/2020 7:30 AM
+InfoDateDmaInstStability	11/10/2022 7:00 PM
+InfoDateDmaThermocoupleCal	7/29/2020 4:59 AM
+InfoDateDmaPwrAmpOfst	4/7/2022 3:06 PM
+InfoDateSpare17	7/29/2020 4:59 AM
+[Calibration Parameters]
+SPFrtScaleHi	2055.241
+InfoOlStressTol	1.000e-2
+InfoOlStressMaxCnt	0
+InfoIntSpare8	0
+Collect data only when stable	Enabled
+Temperature option	Disable
+Temperature Offset	Optimized

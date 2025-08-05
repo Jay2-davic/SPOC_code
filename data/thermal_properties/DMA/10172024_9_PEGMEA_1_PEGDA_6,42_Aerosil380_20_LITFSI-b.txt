@@ -1,0 +1,73 @@
+[File Parameters]
+Name	10172024_PEGDA_PEGMEA_6,42_Aerosil380_20_LITFSI-b
+Instrument type	DMA850
+Instrument serial number	0850-00515
+Instrument name	DMA0850-00515
+Instrument location	LAB
+Company name	LLNL
+Trios version	5.5.0.323
+File name	C:\Users\DSC\Desktop\Johanna Schwartz\SPOC SPEs\mechanical test - PEGDAPEGMEA 6p42 aer380 20percent LITFSI-b.tri
+Run date	10/7/2024 5:05:58 PM
+Preload Direction	-1.00000
+Starting Force	0.100000
+Starting Displacement	4495.06
+Time at start of test	0.419450
+[Clamp Parameters]
+Geometry Type	Compression Clamp
+Name	Compression Clamp
+Thickness	1.27333 mm
+Diameter	5.0 mm
+Notes	Original Thickness = 1.27308 mm
+[Clamp Extended Parameters]
+Clamp mass	37.53 g
+Clamp compliance	0.619038 µm/N
+Stress constant	26253.6 Pa/N
+Strain constant	785.342 1/m
+Reference position	3.222 mm
+Zero reference position	3.222 mm
+Tool mass calibration date	10/7/2024
+Compliance calibration date	10/7/2024
+Use constant volume (true stress/strain)	Disabled
+Reference Volume	0.0250017 mL
+[Firmware Versions]
+Code Image Loader	V2019.12.12
+Main Embedded Kernel	V2021.8.30
+DMA Interface Board	V2019.9.19
+DMA Power Board	V2017.8.9
+[Calibration Date Information]
+Phase angle correction calibration	12/2/2022 10:23 AM
+Transducer static normal calibration	12/2/2022 9:57 AM
+Filter lag correction calibration	12/2/2022 12:15 PM
+Motor torque/motor force constant calibration	12/2/2022 12:49 PM
+Programmable gain amplifier calibration	12/2/2022 11:53 AM
+DMA Inertia phase calibration	12/2/2022 10:03 AM
+DMA Inertia mass calibration	4/7/2022 3:13 PM
+DMA Shaft mass calibration	7/29/2020 5:23 AM
+DMA Force versus position correction calibration	7/29/2020 7:04 AM
+DMA Encoder correction calibration	7/29/2020 7:30 AM
+DMA Installation stability verification	11/10/2022 7:00 PM
+DMA Thermocouple calibration	7/29/2020 4:59 AM
+DMA Power amp offset calibration	4/7/2022 3:06 PM
+DMA LCD Resistance calibration	7/29/2020 4:59 AM
+[Calibration Parameters]
+Transducer full scale	2055.241
+convergence tolerance	1.000e-2
+OSS/OSM: Maximum number of iteration	0
+Target Displacement (Sample=0, Motor=1)	0
+Clamp mass	0.030788
+Clamp compliance	1.531e-7
+Inertia phase calibration residual	0.010794
+Inertia phase correlation coefficient	0.971666
+Inertia phase maximum phase deviation	0.235478
+Phase calibration residual	0.031747
+Phase calibration correlation coefficient	0.490762
+Phase calibration maximum phase deviation	0.179587
+Phase calibration average stiffness	339696.3
+Collect data only when stable	Enabled
+[Temperature Control Information]
+Sample Thermocouple measured	---
+Sample Thermocouple offset	---
+Immersion/Air Thermocouple measured	---
+Immersion/Air Thermocouple offset	---
+Temperature option	Disable
+Temperature Offset	Optimized

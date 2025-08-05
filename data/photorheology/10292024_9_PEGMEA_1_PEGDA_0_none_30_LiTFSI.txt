@@ -1,0 +1,102 @@
+[File Parameters]
+Name	photorheology - 500umgap - 0aero380-30litfsi (8)
+Instrument type	Discovery HR-2
+Instrument serial number	5332-2724
+Instrument name	5332-2724
+Instrument location	NOT_SET
+Company name	LLNL
+Trios version	5.1.1.46572
+File name	C:\ProgramData\TA Instruments\TRIOS\Data\schwartz28\photorheology - 500umgap - 0aero380-30litfsi (8).tri
+Instrument firmware version	9.50
+Run date	10/29/2024 5:14:30 PM
+Time at start of test	0.0772245
+[Geometry Parameters]
+Geometry Type	Parallel plate
+Name	20mm UV parallel plate, UHP Aluminium, Disposable
+Diameter	20.0 mm
+Gap	500.0 µm
+Loading gap	10000.0 µm
+Trim gap offset	100.0 µm
+Material	Steel
+Material	Stainless steel
+Environmental System	UHP
+Notes	
+[Geometry Extended Parameters]
+Expansion coefficient	0.68656 µm/°C
+Expansion coefficient enabled	no
+Compliance	1.03 mrad/N.m
+Geometry Inertia	1.54996 µN.m.s²
+Friction	0.278215 µN.m/(rad/s)
+Friction correction enabled	yes
+Stress constant	636620 Pa/N.m
+Strain constant	20.0 1/rad
+Normal Stress Constant	6366.2 Pa/N
+Fluid Density Constant	2.61799e-12
+[Instrument Options]
+ETC camera available	no
+Friction	0.278215 µN.m/(rad/s)
+Friction calibration date	10/28/2024 12:28:02 PM
+Friction correction enabled	yes
+Rotational mapping date	10/24/2023 1:57:27 PM
+Rotational mapping geometry	20mm UV parallel plate, UHP Aluminium, Disposable
+Rotational mapping number of iterations	2
+Rotational mapping type	precision
+Smart swap enabled	no
+[Temperature Options]
+Gap temperature compensation calibration date	1/1/0001 12:00:00 AM
+Gap temperature compensation enabled	no
+Purge gas only (no active cooling)	no
+Temperature control enabled	yes
+Temperature system control	None
+Upper temperature system fitted	no
+Temperature wait duration	00:00:10 hh:mm:ss
+Temperature wait tolerance	0.200000 °C
+[Inertia Options]
+Instrument inertia	21.4009 µN.m.s²
+Instrument inertia calibration date	10/17/2024 12:37:43 PM
+[Gap Options]
+Axial force for sample compression	1.00000 N
+Closure distance	1000.00 µm
+Closure profile	none
+Closure velocity	100.000 µm/s
+Gap velocity (coarse)	6000.00 µm/s
+Gap velocity (fine)	1000.00 µm/s
+Gap velocity (other)	6000.00 µm/s
+Gap zero mode	axial force
+Gap handling at start of test	Flag mismatches between geometry and instrument gap
+Gap tolerance	4.00000 µm
+Gap wait duration	00:00:02 hh:mm:ss
+Override wait for gap	no
+[Axial Force Control]
+Axial force action outside range	Return to initial value
+Control axial force active	no
+Control axial force max gap change up	1000.00 µm
+Control axial force min gap change down	1000.00 µm
+Control axial force sensitivity	0.100000 N
+Control axial force set initial value	no
+Control axial force type	Compression
+Controlled axial force	1.00000 N
+[Flow Options]
+Flow collect all points	yes
+Flow collect negative shear rate data	yes
+Flow inertia correction	yes
+Flow non-steady state minimum velocity	1.00000e-6 rad/s
+Flow torque limit	0.0100000 µN.m
+Flow velocity limit	1.00000e-6 rad/s
+Flow velocity tolerance	5.00000 %
+Flow zero strain at start of step	yes
+[Oscillation Options]
+Oscillation displacement limit	1.00000e-5 rad
+Oscillation displacement tolerance	5.00000 %
+Oscillation raw phase limit	170.000 °
+Oscillation torque limit	0.100000 µN.m
+Oscillation torque tolerance	1.00000 %
+Oscillation velocity tolerance	5.00000 %
+[Conditioning Options]
+Zero axial force before run	no
+Zero speed after preshear	Leave as is
+Zero velocity threshold	0.100000 rad/s
+[Experiment all steps options]
+Maximum axial force limit	50.0000 N
+Minimum axial force limit	0.100000 N
+Temperature tolerance (results)	1.00000 °C
