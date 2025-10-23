@@ -1,0 +1,17 @@
+colorlog
+cython==0.29.34
+fvcore==0.1.5.post20220305
+joblib
+matplotlib==3.6.3
+numexpr
+numpy==1.19.2
+pandas==1.4.4
+plotly
+pyDOE
+pylint
+PyYAML
+scikit-learn
+scipy==1.9.3
+seaborn==0.12.2
+ternary
+tqdm

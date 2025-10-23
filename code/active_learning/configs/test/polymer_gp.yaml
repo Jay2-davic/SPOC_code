@@ -1,0 +1,22 @@
+data:
+  name: polymer_v4
+
+model:
+  name: gaussian_process
+  params:
+    kernel:
+      name: RQ # [RBF, Matern, RQ, ESS]
+    optimize:
+      optimizer: fmin_l_bfgs_b
+      n_restarts_optimizer: 5
+      alpha: 0.000001
+      normalize_y: true
+      random_state: 42
+
+train:
+  n_seeds: 500
+  n_initial: 2
+  top_ratio: 0.1
+  scaler: standard
+  acquisition: PI # [EI, PI, LCB]
+

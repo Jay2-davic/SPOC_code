@@ -1,0 +1,18 @@
+data:
+  name: polymer_v4
+  #material:   [LiTFSI, NaTFSI]
+  #print_type: [PCB, coin]
+
+model:
+  name: random_forest
+  params:
+    n_estimators: 100
+    n_jobs: -1
+
+train:
+  n_seeds: 2
+  n_initial: 2
+  top_ratio: 0.1
+  scaler: standard
+  acquisition: EI # [EI, PI, LCB]
+

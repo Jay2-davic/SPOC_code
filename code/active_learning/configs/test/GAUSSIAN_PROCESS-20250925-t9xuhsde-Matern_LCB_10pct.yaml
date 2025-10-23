@@ -1,0 +1,13 @@
+data:
+  name: polymer_v4
+model:
+  name: gaussian_process
+  params:
+    kernel:
+      name: Matern
+train:
+  acquisition: LCB
+  n_initial: 2
+  n_seeds: 500
+  scaler: standard
+  top_ratio: 0.1
