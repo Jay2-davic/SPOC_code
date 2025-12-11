@@ -6,8 +6,9 @@ import os
 import sys
 import multiprocessing as mp
 import threading
+import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 import queue
 import uuid
 from tqdm.auto import tqdm
@@ -92,12 +93,12 @@ def delete_if_exists(path: Optional[str]) -> None:
         print(f"[WARN] Could not remove {path}: {exc}", file=sys.stderr)
 
 
-def build_cycle_index_filter(spec: Optional[str]) -> Optional[set]:
+def build_cycle_index_filter(spec: Optional[str]) -> Optional[Set[int]]:
     """
     Accepts:
       - None or "all" -> no filter
       - "1" -> single index
-      - "1,3,5" -> set of indices
+      - "1,3,5" -> set
       - "1-3" -> inclusive range
     """
     if spec is None:
@@ -105,21 +106,27 @@ def build_cycle_index_filter(spec: Optional[str]) -> Optional[set]:
     s = spec.strip().lower()
     if s in ("", "all"):
         return None
-
-    indices = set()
+    indices: Set[int] = set()
     for part in s.split(","):
         part = part.strip()
         if not part:
             continue
         if "-" in part:
             a, b = part.split("-", 1)
-            a = int(a.strip())
-            b = int(b.strip())
+            a = int(a.strip()); b = int(b.strip())
             lo, hi = (a, b) if a <= b else (b, a)
             indices.update(range(lo, hi + 1))
         else:
             indices.add(int(part))
     return indices
+
+def _parse_cycle_index_from_key(key: Any) -> Optional[int]:
+    """
+    Parse a cycle number from keys like 'cycle_1', 'cycle 2', 'cycle-3'.
+    """
+    s = str(key).lower()
+    m = re.search(r'\d+', s)
+    return int(m.group(0)) if m else None
 
 
 def _parse_cycle_index_from_key(key: Any) -> Optional[int]:
@@ -204,6 +211,63 @@ def _fit_task(task):
                 print(f"[DASH] end pid={os.getpid()} {sample_id} {fname} {pointer}", file=sys.stderr)
         except Exception:
             pass
+def enumerate_tasks(
+    eis_results: Dict[str, Any],
+    skip_existing: bool,
+    cycle_filter: Optional[Set[int]],
+    skip_by_pin_status: bool = False,  # default False; you can wire this to a CLI flag
+) -> List[Tuple[str, str, str, Any, Dict[str, Any]]]:
+    """
+    Create tasks across both JSON shapes:
+      - Case A: sample -> file -> cycle_data (list of cycles)
+      - Case B: sample -> pin -> cycle_N (keyed cycles)
+    Returns a list of tuples:
+      ("list", sample_id, file_id, idx, cycle_obj) or
+      ("key", sample_id, pin_id, cycle_key, cycle_obj)
+    """
+    tasks: List[Tuple[str, str, str, Any, Dict[str, Any]]] = []
+
+    for sample_id, sample in (eis_results or {}).items():
+        if not isinstance(sample, dict):
+            continue
+
+        # Iterate nested entries, which may be pins or files
+        for id2, entry in sample.items():
+            if not isinstance(entry, dict):
+                continue
+
+            # Optional pin-level skip, off by default
+            if skip_by_pin_status:
+                pin_fitting = str(entry.get("fitting", "")).lower()
+                if skip_existing and pin_fitting == "ok":
+                    continue
+
+            # Case A: list style under 'cycle_data'
+            if isinstance(entry.get("cycle_data"), list):
+                for idx, c in enumerate(entry["cycle_data"]):
+                    if not isinstance(c, dict):
+                        continue
+                    if skip_existing and str(c.get("fit_status", "")).lower() == "ok":
+                        continue
+                    cidx = c.get("cycle") or c.get("cycle_index", idx)
+                    if cycle_filter is not None and int(cidx) not in cycle_filter:
+                        continue
+                    tasks.append(("list", sample_id, id2, idx, c))
+
+            # Case B: keyed cycles like 'cycle_1'
+            for key, c in entry.items():
+                if not isinstance(c, dict):
+                    continue
+                if not str(key).lower().startswith("cycle_"):
+                    continue
+                if skip_existing and str(c.get("fit_status", "")).lower() == "ok":
+                    continue
+                cidx = c.get("cycle") or c.get("cycle_index") or _parse_cycle_index_from_key(key)
+                if cycle_filter is not None and (cidx is None or int(cidx) not in cycle_filter):
+                    continue
+                tasks.append(("key", sample_id, id2, key, c))
+
+    return tasks
 
 def autoprocess_eis_json(
     json_path: str,
@@ -227,45 +291,28 @@ def autoprocess_eis_json(
     eis_results = data.get("eis_results", {}) or {}
 
     # Build worklist of cycles
-    tasks: List[Tuple[str, str, str, Any, Dict[str, Any]]] = []  # (kind, sample_id, pin_id, key, cycle_obj)
+    cycle_filter = build_cycle_index_filter(os.getenv("EIS_AUTOPROC_CYCLE_INDEX"))
+    # If you want a CLI flag, parse it and pass through instead of env
+    tasks = enumerate_tasks(
+        eis_results=eis_results,
+        skip_existing=skip_existing,
+        cycle_filter=cycle_filter,
+        skip_by_pin_status=False,  # leave False to avoid skipping whole pins
+    )
     
-    cycle_index_filter = os.getenv("EIS_AUTOPROC_CYCLE_INDEX")  # optional filter like "1"
-    for sample_id, sample in (eis_results or {}).items():
-        if not isinstance(sample, dict):
-            continue
-        for pin_id, pin_entry in sample.items():
-            if not isinstance(pin_entry, dict):
-                continue
+    # Optional visibility
+    print(
+        f"[INFO] samples={len(eis_results)}, cycles_to_process={len(tasks)}",
+        file=sys.stderr,
+    )
     
-            # Optional pin-level skip to honor "fitting": "ok"
-            pin_fitting = str(pin_entry.get("fitting", "")).lower()
-            if skip_existing and pin_fitting == "ok":
-                continue
-    
-            for key, cycle_obj in pin_entry.items():
-                if not (isinstance(cycle_obj, dict) and str(key).startswith("cycle_")):
-                    continue
-    
-                # Optional cycle-index filter
-                if cycle_index_filter is not None:
-                    try:
-                        want = int(cycle_index_filter)
-                        if int(cycle_obj.get("cycle", -1)) != want:
-                            continue
-                    except Exception:
-                        pass
-    
-                # Per cycle skip if already fit
-                status = str(cycle_obj.get("fit_status", "")).lower()
-                if skip_existing and status == "ok":
-                    continue
-    
-                tasks.append(("key", sample_id, pin_id, key, cycle_obj))
-
     if not tasks:
         print("[INFO] No cycles require processing, exiting.", file=sys.stderr)
-        atomic_write_json(out_path or json_path, data)
-        delete_if_exists(cleanup_intermediate)
+        atomic_write_json(out_path or json_path, data, fallback_path=cleanup_intermediate)
+        if cleanup_intermediate:
+            delete_if_exists(cleanup_intermediate)
+        if show_progress and pbar is not None:
+            pbar.close()
         return
 
     # Resolve jobs
@@ -391,8 +438,15 @@ def autoprocess_eis_json(
             stop_event.set()
             updater.join(timeout=1.0)
 
+    checkpoint_target = cleanup_intermediate
+    
+    # Checkpoints
+    atomic_write_json(out_path or json_path, data, fallback_path=checkpoint_target)
+    
     # Final write
-    atomic_write_json(out_path or json_path, data)
+    ok = atomic_write_json(out_path or json_path, data, fallback_path=checkpoint_target)
+    if ok and cleanup_intermediate:
+        delete_if_exists(cleanup_intermediate)
 
     if show_progress:
         # Ensure status lines show idle at end and then close bars
