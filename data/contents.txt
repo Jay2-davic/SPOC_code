@@ -1,7 +1,0 @@
-1. renamed eis files
-2. excel files
-3. thermal analysis files
-4. Mouse NMR files
-5. Fluorescence files
-6. rheology/photorheology files
-7. EIS steps files

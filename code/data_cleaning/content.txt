@@ -1,2 +1,0 @@
-1. Cleaning scripts
-2. database integration

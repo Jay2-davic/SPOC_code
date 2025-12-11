@@ -1,0 +1,21 @@
+# RStudio and R session artifacts
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Python cache and editor noise (optional, helpful)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.code-workspace
+.vscode/
+.idea/
+.DS_Store
+
+# Project-specific
+data/
