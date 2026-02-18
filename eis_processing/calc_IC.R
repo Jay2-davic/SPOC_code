@@ -1,317 +1,418 @@
 #!/usr/bin/env Rscript
 
 suppressPackageStartupMessages({
-  library(jsonlite)
-  library(dplyr)
-  library(purrr)
-  library(stringr)
-  library(tibble)
-  library(optparse)
+  if (!requireNamespace("jsonlite", quietly = TRUE)) stop("Please install 'jsonlite'")
+  if (!requireNamespace("dplyr", quietly = TRUE))   stop("Please install 'dplyr'")
+  if (!requireNamespace("purrr", quietly = TRUE))   stop("Please install 'purrr'")
+  if (!requireNamespace("tibble", quietly = TRUE))  stop("Please install 'tibble'")
+  if (!requireNamespace("tidyr", quietly = TRUE))   stop("Please install 'tidyr'")
+  if (!requireNamespace("optparse", quietly = TRUE))stop("Please install 'optparse'")
 })
 
-`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
-as_num <- function(x) suppressWarnings(as.numeric(x))
-is_valid_num <- function(x) is.finite(x) && !is.na(x)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(tidyr)
+library(jsonlite)
+library(optparse)
 
-# ---------------- IO helpers ----------------
+`%||%` <- function(x, y) if (is.null(x)) y else x
 
-read_metadata_raw <- function(path) {
-  obj <- jsonlite::fromJSON(path, simplifyVector = FALSE)
-  if (is.null(obj$samples)) stop("No 'samples' key in metadata JSON: ", path)
-  obj
+# ---------------- JSON sanitization ----------------
+
+read_json_sanitized <- function(path) {
+  txt <- paste(readLines(path, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
+  txt <- sub("^\ufeff", "", txt)                         # Strip BOM
+  txt <- gsub("\\bNaN\\b", "null", txt, perl = TRUE)     # Normalize special numbers
+  txt <- gsub("\\bInfinity\\b", "null", txt, perl = TRUE)
+  txt <- gsub("\\b-Infinity\\b", "null", txt, perl = TRUE)
+  valid <- jsonlite::validate(txt)
+  if (!isTRUE(valid)) stop("Invalid JSON after sanitization: ", valid)
+  jsonlite::fromJSON(txt, simplifyVector = FALSE)
 }
 
-read_external_eis <- function(path) {
-  obj <- jsonlite::fromJSON(path, simplifyVector = FALSE)
-  # Expected shape: { "eis_results": { "<sample_id>": { pin_0001: { ... } } }, "eis_summary": {...} }
-  if (is.null(obj$eis_results) || !is.list(obj$eis_results)) {
-    stop("External EIS JSON missing 'eis_results' object: ", path)
+# ---------------- Safe extract helpers ----------------
+
+safe_extract_chr <- function(obj, path) {
+  val <- purrr::pluck(obj, !!!path, .default = NA_character_)
+  if (is.null(val) || length(val) == 0 || is.na(val)) return(NA_character_)
+  if (is.list(val)) val <- unlist(val, use.names = FALSE)
+  val <- as.character(val)
+  if (length(val) == 0) return(NA_character_)
+  val[1]
+}
+
+safe_extract_num <- function(obj, path) {
+  val <- purrr::pluck(obj, !!!path, .default = NA_real_)
+  if (is.list(val)) val <- unlist(val, use.names = FALSE)
+  val <- suppressWarnings(as.numeric(val))
+  if (length(val) == 0 || all(is.na(val))) return(NA_real_)
+  val[1]
+}
+
+safe_mean_num_list <- function(obj, path) {
+  val <- purrr::pluck(obj, !!!path, .default = NA_real_)
+  if (is.null(val)) return(NA_real_)
+  if (is.list(val)) val <- unlist(val, use.names = FALSE)
+  val <- suppressWarnings(as.numeric(val))
+  if (length(val) == 0 || all(is.na(val))) return(NA_real_)
+  mean(val, na.rm = TRUE)
+}
+
+derive_print_type <- function(sample) {
+  ct <- safe_extract_chr(sample, c("print_quality", "cast_type"))
+  if (is.na(ct)) return(NA_character_)
+  if (grepl("coin", tolower(ct))) "Coin cell" else "PCB print"
+}
+
+extract_spe_thickness_avg_cm <- function(sample) {
+  avg <- safe_extract_num(sample, c("print_quality", "spe_thickness_avg"))
+  if (!is.na(avg)) return(avg)
+  safe_mean_num_list(sample, c("print_quality", "spe_thickness"))
+}
+
+extract_resistance_list <- function(sample) {
+  val <- purrr::pluck(sample, "resistance", .default = NULL)
+  if (is.null(val)) return(numeric(0))
+  if (is.list(val)) val <- unlist(val, use.names = FALSE)
+  v <- suppressWarnings(as.numeric(val))
+  v <- v[!is.na(v)]
+  if (length(v) == 0) numeric(0) else v
+}
+
+find_FittedValue_R1 <- function(x) {
+  if (is.null(x)) return(NA_real_)
+  candidates <- c("FittedValue.R1", "FittedValue_R1", "R1", "Rb", "R_b")
+  for (k in candidates) {
+    val <- x[[k]]
+    if (!is.null(val)) {
+      v <- suppressWarnings(as.numeric(if (is.list(val)) unlist(val, use.names = FALSE) else val))
+      if (length(v) > 0 && !all(is.na(v))) return(v[1])
+    }
   }
-  obj
+  flat <- tryCatch(unlist(x, recursive = TRUE, use.names = TRUE), error = function(e) NULL)
+  if (is.null(flat)) return(NA_real_)
+  nm <- names(flat)
+  idx <- which(nm %in% candidates | grepl("FittedValue\\.R1$", nm))
+  if (length(idx) > 0) {
+    v <- suppressWarnings(as.numeric(flat[idx[1]]))
+    return(v[1])
+  }
+  NA_real_
 }
 
-remove_deprecated_fields <- function(meta_raw) {
-  # Remove at top level when present
-  meta_raw$eis_summary <- NULL
-  meta_raw$ic_sources <- NULL
+# ---------------- Readers ----------------
+
+# Metadata table with minimal fields used for IC computations
+read_metadata_json <- function(path) {
+  j <- jsonlite::fromJSON(path, simplifyVector = FALSE)
+  samples <- j$samples
+  if (is.null(samples)) stop("No 'samples' key found in metadata JSON: ", path)
   
-  # Remove at sample level when present
-  if (!is.null(meta_raw$samples)) {
-    for (sid in names(meta_raw$samples)) {
-      meta_raw$samples[[sid]]$eis_summary <- NULL
-      meta_raw$samples[[sid]]$ic_sources <- NULL
-    }
-  }
-  meta_raw
-}
-
-merge_external_eis_into_metadata <- function(meta_raw, external_eis_raw) {
-  by_sample <- external_eis_raw$eis_results %||% list()
-  for (sid in names(by_sample)) {
-    if (!is.null(meta_raw$samples[[sid]])) {
-      # Copy external EIS object exactly, do not normalize or change structure
-      meta_raw$samples[[sid]]$eis_results <- by_sample[[sid]]
-      # Clean deprecated fields at sample level
-      meta_raw$samples[[sid]]$eis_summary <- NULL
-      meta_raw$samples[[sid]]$ic_sources <- NULL
-    }
-  }
-  # Do not copy external 'eis_summary'; ensure none remain at top level
-  meta_raw$eis_summary <- NULL
-  meta_raw$ic_sources <- NULL
-  meta_raw
-}
-
-as_metadata_df <- function(meta_raw) {
   tibble(
-    sample_id = names(meta_raw$samples),
-    sample_obj = unname(meta_raw$samples)
-  ) |>
+    sample_id  = names(samples),
+    sample_obj = unname(samples)
+  ) %>%
     mutate(
-      area_cm2 = map_dbl(sample_obj, ~ as_num(.x$area_cm2 %||% .x$print_quality$area_cm2 %||% NA_real_)),
-      thickness_cm = map_dbl(sample_obj, ~ as_num(.x$print_quality$spe_thickness_avg %||%
-                                                    .x$print_quality$spe_thickness %||%
-                                                    .x$film_thickness %||% NA_real_)),
-      resistance = map_dbl(sample_obj, ~ as_num(.x$resistance %||% NA_real_)),
-      existing_R1_len = map_int(sample_obj, ~ length(.x$R1 %||% list())),
-      existing_ic_len = map_int(sample_obj, ~ length(.x$ionic_conductivity_final %||% list())),
-      existing_ic_geom_len = map_int(sample_obj, ~ length(.x$ionic_conductivity_final_geom_factor_applied %||% list()))
+      print_type              = purrr::map_chr(sample_obj, derive_print_type),
+      area_cm2                = purrr::map_dbl(sample_obj, ~ safe_extract_num(.x, c("print_quality", "area_cm2"))),
+      spe_thickness_avg       = purrr::map_dbl(sample_obj, extract_spe_thickness_avg_cm),
+      ionic_conductivity_s_cm = purrr::map_dbl(sample_obj, ~ safe_extract_num(.x, c("ionic_conductivity_s_cm"))),
+      resistance_list         = purrr::map(sample_obj, extract_resistance_list)
     )
 }
 
-# ---------------- EIS extraction (no structure changes) ----------------
-
-extract_cycles_any_shape <- function(pin_entry) {
-  # Prefer normalized 'cycle_data' when present
-  if (!is.null(pin_entry$cycle_data) && is.list(pin_entry$cycle_data)) {
-    return(pin_entry$cycle_data)
-  }
-  # Else collect 'cycle_N' keys, preserving objects exactly
-  nms <- names(pin_entry) %||% character(0)
-  cyc_keys <- nms[grepl("^cycle_[0-9]+$", nms)]
-  if (length(cyc_keys) == 0) return(list())
-  
-  cycles <- lapply(cyc_keys, function(ck) {
-    cobj <- pin_entry[[ck]]
-    if (is.null(cobj$cycle)) {
-      # Add cycle number in-memory for ordering only; do not write back
-      cobj$cycle <- as_num(sub("^cycle_", "", ck))
-    }
-    cobj
-  })
-  # Sort by numeric cycle index if present
-  ord <- sapply(cycles, function(x) as_num(x$cycle %||% NA_real_))
-  cycles[order(ord, na.last = TRUE)]
-}
-
-parse_pin_ord <- function(pin_label, pin_entry) {
-  p <- pin_entry$pin
-  if (!is.null(p)) return(as_num(p))
-  m <- stringr::str_extract(pin_label %||% "", "[0-9]+")
-  as_num(m)
-}
-
-collect_r1_from_eis <- function(sample_obj) {
-  eis <- sample_obj$eis_results
-  if (is.null(eis) || length(eis) == 0) return(numeric(0))
-  
-  rows <- imap(eis, function(pin_entry, pin_label) {
-    pin_ord <- parse_pin_ord(pin_label, pin_entry) %||% NA_real_
-    cycles <- extract_cycles_any_shape(pin_entry)
-    
-    map(seq_along(cycles), function(i) {
-      cobj <- cycles[[i]]
-      fit_status <- tolower(cobj$fit_status %||% "")
-      # Include when 'ok' or missing
-      if (nzchar(fit_status) && fit_status != "ok") return(NULL)
-      
-      r1 <- as_num(cobj[["FittedValue.R1"]] %||% NA_real_)
-      if (is.na(r1)) return(NULL)
-      
-      cy_idx <- cobj$cycle %||% i
-      list(pin_ord = as_num(pin_ord), cycle_idx = as_num(cy_idx), r1 = r1)
-    }) |> compact()
-  }) |> flatten()
-  
-  if (length(rows) == 0) return(numeric(0))
-  
-  tibble(
-    pin_ord = map_dbl(rows, "pin_ord"),
-    cycle_idx = map_dbl(rows, "cycle_idx"),
-    r1 = map_dbl(rows, "r1")
-  ) |>
-    arrange(pin_ord, cycle_idx) |>
-    pull(r1)
-}
-
-# ---------------- IC computation ----------------
-
-# sigma = thickness_cm / (R * area_cm2)
-compute_sigma <- function(R_vec, thickness_cm, area_cm2) {
-  if (length(R_vec) == 0) return(numeric(0))
-  if (!is_valid_num(thickness_cm) || !is_valid_num(area_cm2) || area_cm2 <= 0) {
-    return(rep(NA_real_, length(R_vec)))
-  }
-  (thickness_cm / area_cm2) / R_vec
-}
-
-compute_sample_arrays <- function(sample_obj) {
-  r1_vec <- collect_r1_from_eis(sample_obj)
-  
-  area <- as_num(sample_obj$area_cm2 %||% sample_obj$print_quality$area_cm2 %||% NA_real_)
-  thickness <- as_num(sample_obj$print_quality$spe_thickness_avg %||%
-                        sample_obj$print_quality$spe_thickness %||%
-                        sample_obj$film_thickness %||% NA_real_)
-  res <- as_num(sample_obj$resistance %||% NA_real_)
-  
-  if (length(r1_vec) == 0) {
-    # Fallback to resistance as a single-element array only when no fitted R1 exists
-    if (is_valid_num(res) && res > 0) {
-      r1_vec <- c(res)
-    } else {
-      return(list(
-        R1 = numeric(0),
-        ionic_conductivity_final = numeric(0),
-        ionic_conductivity_final_geom_factor_applied = numeric(0)
-      ))
-    }
+# EIS fitted values long form
+read_eis_long <- function(path) {
+  j <- read_json_sanitized(path)
+  eis_results <- j$eis_results
+  if (is.null(eis_results) || length(eis_results) == 0) {
+    stop("Could not find 'eis_results' entries in EIS JSON: ", path)
   }
   
-  sigma <- compute_sigma(r1_vec, thickness, area)
-  sigma_geom <- sigma  # keep aligned and identical unless you specify a different geom factor
+  # New schema: sample_id -> pin_* -> cycle_*
+  new_tbl <- tryCatch({
+    purrr::imap_dfr(eis_results, function(sample_entry, sample_id) {
+      purrr::imap_dfr(sample_entry, function(pin_entry, pin_key) {
+        if (!is.list(pin_entry)) return(NULL)
+        file_name <- pin_entry$file_name %||% pin_key
+        cycle_names <- names(pin_entry)
+        cycle_names <- cycle_names[grepl("^cycle_\\d+$", cycle_names)]
+        if (length(cycle_names) == 0) return(NULL)
+        purrr::map_dfr(cycle_names, function(cname) {
+          cy <- pin_entry[[cname]]
+          if (is.null(cy) || !is.list(cy)) return(NULL)
+          tibble(
+            sample_id        = sample_id,
+            pin_id           = as.character(pin_key),
+            file_name        = as.character(file_name),
+            cycle_idx        = suppressWarnings(as.numeric(safe_extract_num(cy, c("cycle")))),
+            fit_status       = safe_extract_chr(cy, c("fit_status")),
+            `FittedValue.R1` = find_FittedValue_R1(cy)
+          )
+        })
+      })
+    })
+  }, error = function(e) NULL)
   
-  list(
-    R1 = r1_vec,
-    ionic_conductivity_final = sigma,
-    ionic_conductivity_final_geom_factor_applied = sigma_geom
-  )
+  rows <- NULL
+  if (!is.null(new_tbl) && nrow(new_tbl) > 0) {
+    rows <- new_tbl %>% filter(is.na(fit_status) | fit_status == "ok")
+  } else {
+    # Legacy schema: sample_id -> file_name -> cycle_data[]
+    rows <- purrr::imap_dfr(eis_results, function(sample, sample_id) {
+      purrr::imap_dfr(sample, function(file_entry, file_name) {
+        cycles <- file_entry$cycle_data
+        if (is.null(cycles) || length(cycles) == 0) return(NULL)
+        purrr::imap_dfr(cycles, function(cycle, cycle_idx) {
+          tibble(
+            sample_id        = sample_id,
+            pin_id           = NA_character_,
+            file_name        = as.character(file_name),
+            cycle_idx        = suppressWarnings(as.numeric(cycle_idx)),
+            fit_status       = NA_character_,
+            `FittedValue.R1` = suppressWarnings(as.numeric(cycle$FittedValue.R1))
+          )
+        })
+      })
+    })
+  }
+  
+  if (is.null(rows) || nrow(rows) == 0) {
+    return(tibble(
+      sample_id = character(), pin_id = character(), file_name = character(),
+      cycle_idx = numeric(), `FittedValue.R1` = numeric()
+    ))
+  }
+  
+  rows %>%
+    filter(!is.na(`FittedValue.R1`)) %>%
+    arrange(sample_id, file_name, cycle_idx)
+}
+
+# ---------------- Calculation rows ----------------
+
+compute_rows <- function(meta_df, eis_long) {
+  meta_prep <- meta_df %>%
+    mutate(
+      resistance_list         = purrr::map(resistance_list, function(x) {
+        if (is.null(x)) return(numeric(0))
+        v <- suppressWarnings(as.numeric(unlist(x, use.names = FALSE)))
+        v[is.finite(v)]
+      }),
+      area_cm2                = suppressWarnings(as.numeric(area_cm2)),
+      spe_thickness_avg       = suppressWarnings(as.numeric(spe_thickness_avg)/10), # thickness in mm convert to cm
+      ionic_conductivity_s_cm = suppressWarnings(as.numeric(ionic_conductivity_s_cm))
+    )
+  
+  # Fit-based rows (0.4/R1 and geom = 0 per your SSna_99 example)
+  fits_long <- eis_long %>%
+    select(sample_id, pin_id, file_name, cycle_idx, `FittedValue.R1`) %>%
+    left_join(meta_prep %>% select(sample_id, print_type, area_cm2, spe_thickness_avg, ionic_conductivity_s_cm), by = "sample_id") %>%
+    mutate(
+      measurement_source = "fit_R1",
+      `FittedValue.R1` = suppressWarnings(as.numeric(`FittedValue.R1`)),
+      ionic_conductivity_final = ifelse(is.finite(`FittedValue.R1`), 0.4 / `FittedValue.R1`, NA_real_),
+      # Geometry factor applied is zero for fit rows in your SSna_99
+      ionic_conductivity_final_geom_factor_applied = ifelse(is.finite(`FittedValue.R1`), 0, NA_real_),
+      resistance = NA_real_,
+      res_index  = NA_integer_
+    ) %>%
+    select(
+      sample_id, measurement_source, res_index, pin_id, file_name, cycle_idx,
+      resistance, `FittedValue.R1`,
+      ionic_conductivity_final, ionic_conductivity_final_geom_factor_applied,
+      print_type, area_cm2, spe_thickness_avg
+    )
+  
+  # Resistance-based rows: coin cells use L/(R*A), keep same for PCB if you carry resistances
+  res_rows <- meta_prep %>%
+    filter(lengths(resistance_list) > 0) %>%
+    select(sample_id, print_type, area_cm2, spe_thickness_avg, resistance_list) %>%
+    unnest_longer(resistance_list, values_to = "resistance") %>%
+    group_by(sample_id) %>%
+    mutate(res_index = dplyr::row_number()) %>%
+    ungroup() %>%
+    mutate(
+      measurement_source = ifelse(tolower(print_type) == "coin cell", "coin_cell", "resistance"),
+      resistance = suppressWarnings(as.numeric(resistance)),
+      ionic_conductivity_final = ifelse(
+        is.finite(spe_thickness_avg) & spe_thickness_avg > 0 &
+          is.finite(area_cm2) & area_cm2 > 0 &
+          is.finite(resistance) & resistance > 0,
+        spe_thickness_avg / (resistance * area_cm2),
+        NA_real_
+      ),
+      ionic_conductivity_final_geom_factor_applied = ionic_conductivity_final,
+      `FittedValue.R1` = NA_real_,
+      pin_id    = NA_character_,
+      file_name = NA_character_,
+      cycle_idx = NA_real_
+    ) %>%
+    select(
+      sample_id, measurement_source, res_index, pin_id, file_name, cycle_idx,
+      resistance, `FittedValue.R1`,
+      ionic_conductivity_final, ionic_conductivity_final_geom_factor_applied,
+      print_type, area_cm2, spe_thickness_avg
+    )
+  
+  bind_rows(fits_long, res_rows) %>%
+    mutate(precedence = dplyr::case_when(
+      measurement_source == "fit_R1"    ~ 1L,
+      measurement_source == "coin_cell" ~ 2L,
+      measurement_source == "resistance"~ 2L,
+      TRUE ~ 99L
+    )) %>%
+    arrange(sample_id, precedence, pin_id, file_name, cycle_idx, res_index)
 }
 
 # ---------------- Injection ----------------
 
-as_json_array <- function(num_vec) {
-  if (length(num_vec) == 0) return(list())
-  as.list(unname(num_vec))
-}
-
-inject_results_back <- function(meta_raw, results_tbl, overwrite_existing = FALSE) {
-  samples <- meta_raw$samples
-  ids <- results_tbl$sample_id
-  
-  for (i in seq_along(ids)) {
-    id <- ids[i]
-    sobj <- samples[[id]]
-    if (is.null(sobj)) next
-    
-    # Remove deprecated keys when present at sample level
-    sobj$eis_summary <- NULL
-    sobj$ic_sources <- NULL
-    
-    arrays <- results_tbl$arrays[[i]]
-    
-    already_has_arrays <- !is.null(sobj$R1) ||
-      !is.null(sobj$ionic_conductivity_final) ||
-      !is.null(sobj$ionic_conductivity_final_geom_factor_applied)
-    
-    if (already_has_arrays && !isTRUE(overwrite_existing)) {
-      samples[[id]] <- sobj
-      next
-    }
-    
-    sobj$R1 <- as_json_array(arrays$R1)
-    sobj$ionic_conductivity_final <- as_json_array(arrays$ionic_conductivity_final)
-    sobj$ionic_conductivity_final_geom_factor_applied <- as_json_array(arrays$ionic_conductivity_final_geom_factor_applied)
-    
-    samples[[id]] <- sobj
+strip_ic_scalars <- function(meta_raw) {
+  if (is.null(meta_raw$samples)) return(meta_raw)
+  for (id in names(meta_raw$samples)) {
+    if (is.null(meta_raw$samples[[id]])) next
+    meta_raw$samples[[id]]$ionic_conductivity_final_scalar <- NULL
+    meta_raw$samples[[id]]$ionic_conductivity_final_geom_factor_applied_scalar <- NULL
   }
-  
-  meta_raw$samples <- samples
-  
-  # Also clean any deprecated fields at top level
-  meta_raw$eis_summary <- NULL
-  meta_raw$ic_sources <- NULL
-  
   meta_raw
 }
 
-# ---------------- Orchestration ----------------
+inject_rows_back <- function(meta_raw, rows_tbl) {
+  if (is.null(meta_raw$samples)) stop("Malformed metadata object, 'samples' missing.")
+  by_sample <- split(rows_tbl, rows_tbl$sample_id)
+  
+  for (sid in names(by_sample)) {
+    rows <- by_sample[[sid]]
+    if (is.null(meta_raw$samples[[sid]])) next
+    
+    # Build ionic_conductivity_calcs entries with only scalar fields
+    calcs <- purrr::pmap(
+      rows %>%
+        dplyr::select(
+          measurement_source, res_index, pin_id, file_name, cycle_idx,
+          resistance, `FittedValue.R1`,
+          ionic_conductivity_final, ionic_conductivity_final_geom_factor_applied,
+          print_type, area_cm2, spe_thickness_avg
+        ),
+      function(measurement_source, res_index, pin_id, file_name, cycle_idx,
+               resistance, `FittedValue.R1`,
+               ionic_conductivity_final, ionic_conductivity_final_geom_factor_applied,
+               print_type, area_cm2, spe_thickness_avg) {
+        
+        rec <- list(
+          measurement_source = measurement_source %||% NA_character_,
+          res_index          = if (is.na(res_index)) NA_real_ else res_index,
+          pin_id             = if (is.null(pin_id)) NA_character_ else pin_id,
+          file_name          = if (is.null(file_name)) NA_character_ else file_name,
+          cycle_idx          = if (is.na(cycle_idx)) NA_real_ else cycle_idx,
+          resistance         = if (is.na(resistance)) NA_real_ else resistance,
+          FittedValue_R1     = if (is.na(`FittedValue.R1`)) NA_real_ else `FittedValue.R1`,
+          ionic_conductivity_final = if (is.na(ionic_conductivity_final)) NA_real_ else ionic_conductivity_final,
+          ionic_conductivity_final_geom_factor_applied = if (is.na(ionic_conductivity_final_geom_factor_applied)) NA_real_ else ionic_conductivity_final_geom_factor_applied
+        )
+        # Include thickness and area only for coin cells
+        if (!is.na(print_type) && tolower(print_type) == "coin cell") {
+          rec$spe_thickness_avg <- if (is.na(spe_thickness_avg)) NA_real_ else spe_thickness_avg
+          rec$area_cm2 <- if (is.na(area_cm2)) NA_real_ else area_cm2
+        }
+        rec
+      }
+    )
+    
+    # Top-level outputs: drop NA, write scalar for one, array for many
+    ic_final <- rows$ionic_conductivity_final
+    ic_geom  <- rows$ionic_conductivity_final_geom_factor_applied
+    ic_final <- ic_final[!is.na(ic_final)]
+    ic_geom  <- ic_geom[!is.na(ic_geom)]
+    
+    meta_raw$samples[[sid]]$ionic_conductivity_calcs <- calcs
+    
+    if (length(ic_final) == 0) {
+      # if nothing computed, do not create an empty array key
+      meta_raw$samples[[sid]]$ionic_conductivity_final <- NULL
+    } else if (length(ic_final) == 1) {
+      meta_raw$samples[[sid]]$ionic_conductivity_final <- ic_final[[1]]
+    } else {
+      meta_raw$samples[[sid]]$ionic_conductivity_final <- unname(ic_final)
+    }
+    
+    if (length(ic_geom) == 0) {
+      meta_raw$samples[[sid]]$ionic_conductivity_final_geom_factor_applied <- NULL
+    } else if (length(ic_geom) == 1) {
+      meta_raw$samples[[sid]]$ionic_conductivity_final_geom_factor_applied <- ic_geom[[1]]
+    } else {
+      meta_raw$samples[[sid]]$ionic_conductivity_final_geom_factor_applied <- unname(ic_geom)
+    }
+  }
+  
+  strip_ic_scalars(meta_raw)
+}
 
-update_ionic_conductivity <- function(metadata_json,
-                                      external_eis_json = NULL,
-                                      overwrite_existing = FALSE,
+# ---------------- Updater ----------------
+
+update_ionic_conductivity <- function(sample_file, eis_file,
                                       write_out = TRUE) {
-  meta_raw <- read_metadata_raw(metadata_json)
+  meta_raw <- jsonlite::fromJSON(sample_file, simplifyVector = FALSE)
+  meta_df  <- read_metadata_json(sample_file)
+  eis_long <- read_eis_long(eis_file)
   
-  # Merge external EIS when provided; do not normalize or change cycle structure
-  if (!is.null(external_eis_json)) {
-    ext_raw <- read_external_eis(external_eis_json)
-    meta_raw <- merge_external_eis_into_metadata(meta_raw, ext_raw)
-  }
-  
-  # Always remove deprecated fields if present
-  meta_raw <- remove_deprecated_fields(meta_raw)
-  
-  meta_df <- as_metadata_df(meta_raw)
-  
-  meta_df <- meta_df |>
-    mutate(needs_calc = overwrite_existing |
-             (existing_R1_len == 0 | existing_ic_len == 0 | existing_ic_geom_len == 0))
-  
-  to_calc <- meta_df |> filter(needs_calc)
-  
-  if (nrow(to_calc) == 0) {
-    message("No samples require calculation. Nothing to do.")
-    return(invisible(tibble()))
-  }
-  
-  results <- to_calc |>
-    mutate(arrays = map(sample_obj, compute_sample_arrays),
-           r1_len = map_int(arrays, ~ length(.x$R1)),
-           ic_len = map_int(arrays, ~ length(.x$ionic_conductivity_final))) |>
-    select(sample_id, area_cm2, thickness_cm, resistance, r1_len, ic_len, arrays)
+  rows <- compute_rows(meta_df, eis_long)
   
   if (isTRUE(write_out)) {
-    meta_updated <- inject_results_back(meta_raw, results, overwrite_existing = overwrite_existing)
-    jsonlite::write_json(meta_updated, metadata_json, pretty = TRUE, auto_unbox = TRUE, na = "null")
+    updated <- inject_rows_back(meta_raw, rows)
+    # auto_unbox = TRUE gives scalars for length-1 and arrays for length>1
+    jsonlite::write_json(updated, sample_file, pretty = TRUE, auto_unbox = TRUE, na = "null")
   }
   
-  invisible(results)
+  invisible(rows)
 }
 
 # ---------------- CLI ----------------
 
 option_list <- list(
-  optparse::make_option(c("-m", "--meta"), type = "character",
-                        help = "Path to primary metadata JSON with 'samples' object", metavar = "FILE"),
-  optparse::make_option(c("-e", "--eis"), type = "character", default = NULL,
-                        help = "Optional path to external EIS JSON to merge (structure preserved)", metavar = "FILE"),
-  optparse::make_option(c("--overwrite"), action = "store_true", default = FALSE,
-                        help = "Overwrite existing arrays R1 and ionic_conductivity_*"),
+  optparse::make_option(c("-s", "--sample-file"), type = "character",
+                        help = "Path to sample metadata JSON with 'samples' object", metavar = "FILE"),
+  optparse::make_option(c("-e", "--eis-file"), type = "character",
+                        help = "Path to EIS fitted results JSON", metavar = "FILE"),
   optparse::make_option(c("--dry-run"), action = "store_true", default = FALSE,
                         help = "Do not write JSON, only print a summary")
 )
 
-opt <- optparse::parse_args(optparse::OptionParser(option_list = option_list))
+parser <- optparse::OptionParser(
+  usage = "Usage: %prog -s SAMPLE_JSON -e EIS_JSON [--dry-run]",
+  option_list = option_list
+)
+opt <- optparse::parse_args(parser, print_help_and_exit = FALSE)
 
-if (is.null(opt$meta)) {
-  cat("Error: --meta is required\n", file = stderr())
+if (is.null(opt$`sample-file`)) {
+  optparse::print_help(parser)
+  cat("\nError: --sample-file is required\n", file = stderr())
   quit(status = 2)
 }
-if (!file.exists(opt$meta)) {
-  cat("Error: metadata JSON not found: ", opt$meta, "\n", sep = "", file = stderr())
-  quit(status = 2)
-}
-if (!is.null(opt$eis) && !file.exists(opt$eis)) {
-  cat("Error: external EIS JSON not found: ", opt$eis, "\n", sep = "", file = stderr())
+if (is.null(opt$`eis-file`)) {
+  optparse::print_help(parser)
+  cat("\nError: --eis-file is required\n", file = stderr())
   quit(status = 2)
 }
 
-results <- tryCatch(
+sample_file <- opt$`sample-file`
+eis_file    <- opt$`eis-file`
+
+if (!file.exists(sample_file)) {
+  cat("Error: sample JSON not found: ", sample_file, "\n", sep = "", file = stderr())
+  quit(status = 2)
+}
+if (!file.exists(eis_file)) {
+  cat("Error: EIS JSON not found: ", eis_file, "\n", sep = "", file = stderr())
+  quit(status = 2)
+}
+
+rows <- tryCatch(
   update_ionic_conductivity(
-    metadata_json     = opt$meta,
-    external_eis_json = opt$eis,
-    overwrite_existing = isTRUE(opt$overwrite),
-    write_out          = !isTRUE(opt$dry_run)
+    sample_file = sample_file,
+    eis_file    = eis_file,
+    write_out   = !isTRUE(opt$`dry-run`)
   ),
   error = function(e) {
     cat("calc_IC.R error: ", conditionMessage(e), "\n", file = stderr())
@@ -319,15 +420,15 @@ results <- tryCatch(
   }
 )
 
-if (isTRUE(opt$dry_run)) {
-  if (is.null(results) || nrow(results) == 0) {
-    cat("Dry run: no results to display\n")
+if (isTRUE(opt$`dry-run`)) {
+  if (is.null(rows) || nrow(rows) == 0) {
+    cat("Dry run: no rows computed\n")
   } else {
-    cat("Dry run summary (first 10 rows):\n")
-    print(utils::head(results |> select(sample_id, r1_len, ic_len), 10))
+    cat("Dry run: first 10 rows\n")
+    print(utils::head(rows, 10))
   }
 } else {
-  cat("Ionic conductivity arrays updated. Output written to: ", opt$meta, "\n", sep = "")
+  cat("Ionic conductivity updated. Output written to: ", sample_file, "\n", sep = "")
 }
 
 quit(status = 0)

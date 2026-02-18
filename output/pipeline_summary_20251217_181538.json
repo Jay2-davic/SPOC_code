@@ -1,0 +1,115 @@
+{
+  "summary_stats": [
+    {
+      "metric": "Total samples",
+      "count": 1374,
+      "percentage": 100
+    },
+    {
+      "metric": "PCB samples",
+      "count": 960,
+      "percentage": 69.9
+    },
+    {
+      "metric": "Coin samples",
+      "count": 258,
+      "percentage": 18.8
+    },
+    {
+      "metric": "Complete data",
+      "count": 107,
+      "percentage": 7.8
+    },
+    {
+      "metric": "With salt",
+      "count": 1257,
+      "percentage": 91.5
+    },
+    {
+      "metric": "Outliers detected",
+      "count": 3,
+      "percentage": 0.2
+    }
+  ],
+  "ic_statistics": [
+    {
+      "metric": "Mean IC",
+      "value": 0.0015
+    },
+    {
+      "metric": "Median IC",
+      "value": 3.7931e-06
+    },
+    {
+      "metric": "Min IC",
+      "value": 0
+    },
+    {
+      "metric": "Max IC",
+      "value": 0.0573
+    }
+  ],
+  "flag_summary": [
+    {
+      "flag": "flag_pcb",
+      "n_true": 960,
+      "n_false": 399,
+      "pct_true": 70.6
+    },
+    {
+      "flag": "flag_coin",
+      "n_true": 258,
+      "n_false": 1101,
+      "pct_true": 19
+    },
+    {
+      "flag": "flag_has_ic",
+      "n_true": 108,
+      "n_false": 1266,
+      "pct_true": 7.9
+    },
+    {
+      "flag": "flag_has_thickness",
+      "n_true": 1320,
+      "n_false": 54,
+      "pct_true": 96.1
+    },
+    {
+      "flag": "flag_has_area",
+      "n_true": 1292,
+      "n_false": 82,
+      "pct_true": 94
+    },
+    {
+      "flag": "flag_has_salt",
+      "n_true": 1257,
+      "n_false": 117,
+      "pct_true": 91.5
+    },
+    {
+      "flag": "flag_salt_10wt",
+      "n_true": 0,
+      "n_false": 1374,
+      "pct_true": 0
+    },
+    {
+      "flag": "flag_salt_20wt",
+      "n_true": 16,
+      "n_false": 1358,
+      "pct_true": 1.2
+    },
+    {
+      "flag": "flag_complete",
+      "n_true": 107,
+      "n_false": 1267,
+      "pct_true": 7.8
+    },
+    {
+      "flag": "flag_outlier",
+      "n_true": 3,
+      "n_false": 105,
+      "pct_true": 2.8
+    }
+  ],
+  "timestamp": "2025-12-17 18:15:38"
+}

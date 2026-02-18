@@ -1,0 +1,53 @@
+{
+  "summary_stats": [
+    {
+      "metric": "Total samples",
+      "count": 1374,
+      "percentage": 100
+    },
+    {
+      "metric": "PCB samples",
+      "count": 960,
+      "percentage": 69.9
+    },
+    {
+      "metric": "Coin samples",
+      "count": 258,
+      "percentage": 18.8
+    },
+    {
+      "metric": "Complete data",
+      "count": 107,
+      "percentage": 7.8
+    },
+    {
+      "metric": "With salt",
+      "count": 1257,
+      "percentage": 91.5
+    },
+    {
+      "metric": "Outliers detected",
+      "count": 3,
+      "percentage": 0.2
+    }
+  ],
+  "ic_statistics": [
+    {
+      "metric": "Mean IC",
+      "value": 0.0015
+    },
+    {
+      "metric": "Median IC",
+      "value": 3.7931e-06
+    },
+    {
+      "metric": "Min IC",
+      "value": 0
+    },
+    {
+      "metric": "Max IC",
+      "value": 0.0573
+    }
+  ],
+  "timestamp": "2025-12-17 18:49:50"
+}

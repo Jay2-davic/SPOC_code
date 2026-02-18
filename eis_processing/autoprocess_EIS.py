@@ -1,51 +1,43 @@
-#autoprocess_EIS.py
+# autoprocess_EIS.py
 
+#!/usr/bin/env python3
 import argparse
 import json
 import os
 import sys
 import multiprocessing as mp
 import threading
-import re
 import time
-from typing import Any, Dict, List, Optional, Tuple, Set
-import queue
+import shutil
 import uuid
+import queue
+from typing import Any, Dict, List, Optional, Tuple
+
 from tqdm.auto import tqdm
 
-# Local import for your existing fit function
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from autoprocess_functions import fit_cycle_from_cycle_obj  # or wherever it lives
+# Prefer local import first, with robust fallback
+try:
+    import autoprocess_functions as apf
+    from autoprocess_functions import fit_cycle_from_cycle_obj
+except ImportError:
+    script_dir = os.path.abspath(os.path.dirname(__file__))
+    sys.path.insert(0, script_dir)
+    import autoprocess_functions as apf
+    from autoprocess_functions import fit_cycle_from_cycle_obj
 
+# Global status queue handle, wired in each worker by the pool initializer
 STATUS_QUEUE = None
 
-def _run_status_updater(stop_event, status_q, worker_bars, pid_to_slot, free_slots):
+def atomic_write_json(
+    path: str,
+    obj: dict,
+    retries: int = 8,
+    backoff_sec: float = 0.25,
+    fallback_path: Optional[str] = None,
+) -> bool:
     """
-    Continuously drain the status queue and refresh worker status lines.
-    Runs until stop_event is set.
-    """
-    while not stop_event.is_set():
-        _drain_status_queue(status_q, worker_bars, pid_to_slot, free_slots)
-        time.sleep(0.1)  # 100 ms refresh cadence
-
-def _init_worker(status_queue):
-    """
-    Called in each worker process. Wires a global status queue and
-    limits BLAS threads to avoid oversubscription stalls.
-    """
-    global STATUS_QUEUE
-    STATUS_QUEUE = status_queue
-
-    # Thread limiting, helps prevent stalls with numpy/scipy BLAS
-    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-
-
-def atomic_write_json(path: str, obj: dict, retries: int = 8, backoff_sec: float = 0.25, fallback_path: Optional[str] = None) -> bool:
-    """
-    Try to atomically write JSON to 'path', retrying on Windows lock.
-    Fall back to writing a checkpoint file if replace fails.
+    Try to atomically write JSON to 'path', retrying on Windows lock,
+    and fall back to writing a checkpoint file if replace fails.
     Returns True on success, False if only fallback succeeded.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -63,12 +55,11 @@ def atomic_write_json(path: str, obj: dict, retries: int = 8, backoff_sec: float
             os.replace(tmp, path)
             return True
         except PermissionError:
-            # Target locked, wait and retry
             time.sleep(backoff_sec * (attempt + 1))
         except Exception:
             time.sleep(backoff_sec * (attempt + 1))
 
-    # Fallback: write to a checkpoint path if provided, else side-by-side .checkpoint
+    # Fallback: write to checkpoint file
     try:
         cp = fallback_path or f"{path}.checkpoint"
         os.makedirs(os.path.dirname(cp) or ".", exist_ok=True)
@@ -84,6 +75,7 @@ def atomic_write_json(path: str, obj: dict, retries: int = 8, backoff_sec: float
             pass
     return False
 
+
 def delete_if_exists(path: Optional[str]) -> None:
     try:
         if path and os.path.exists(path):
@@ -93,181 +85,160 @@ def delete_if_exists(path: Optional[str]) -> None:
         print(f"[WARN] Could not remove {path}: {exc}", file=sys.stderr)
 
 
-def build_cycle_index_filter(spec: Optional[str]) -> Optional[Set[int]]:
-    """
-    Accepts:
-      - None or "all" -> no filter
-      - "1" -> single index
-      - "1,3,5" -> set
-      - "1-3" -> inclusive range
-    """
-    if spec is None:
-        return None
-    s = spec.strip().lower()
-    if s in ("", "all"):
-        return None
-    indices: Set[int] = set()
-    for part in s.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, b = part.split("-", 1)
-            a = int(a.strip()); b = int(b.strip())
-            lo, hi = (a, b) if a <= b else (b, a)
-            indices.update(range(lo, hi + 1))
-        else:
-            indices.add(int(part))
-    return indices
+def _init_worker(status_queue):
+    global STATUS_QUEUE
+    STATUS_QUEUE = status_queue
 
-def _parse_cycle_index_from_key(key: Any) -> Optional[int]:
-    """
-    Parse a cycle number from keys like 'cycle_1', 'cycle 2', 'cycle-3'.
-    """
-    s = str(key).lower()
-    m = re.search(r'\d+', s)
-    return int(m.group(0)) if m else None
+    # Ensure headless mode in workers to avoid GUI imports
+    os.environ.setdefault("EIS_HEADLESS", "1")
+
+    # Limit BLAS threads to avoid oversubscription stalls
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    # Apply default guardrails in workers too
+    os.environ.setdefault("EIS_ATTEMPTS", "120")
+    os.environ.setdefault("EIS_ROUND_BUDGET_SEC", "120")
+    os.environ.setdefault("EIS_MAX_POINTS", "600")
+
+    # Install progress emitter in this worker
+    def _emit(event: str, **kw):
+        try:
+            STATUS_QUEUE.put(("progress", os.getpid(), event, kw))
+        except Exception:
+            pass
+    apf.PROGRESS_EMITTER = _emit
 
 
-def _parse_cycle_index_from_key(key: Any) -> Optional[int]:
-    """
-    Fallback: derive cycle number from key names like 'cycle_1'
-    """
-    s = str(key).lower()
-    for prefix in ("cycle_", "cycle-", "cycle "):
-        if s.startswith(prefix):
-            try:
-                return int(s.replace(prefix, "", 1))
-            except ValueError:
-                return None
-    try:
-        return int(s)
-    except ValueError:
-        return None
-      
-def _format_task_label(kind, sample_id, fname, pointer):
-    # Short label to keep lines readable
-    ptr = str(pointer)
-    return f'{sample_id} | {fname} | {kind}:{ptr}'
+def _format_task_label(sample_id, pin_id, cycle_key):
+    return f'{sample_id} | {pin_id} | {cycle_key}'
+
+
+WORKER_TOTALS: Dict[int, int] = {}
 
 def _drain_status_queue(status_q, worker_bars, pid_to_slot, free_slots):
     """
-    Drain pending worker status events and refresh fixed lines.
-    Safe against queue empties and proxy EOF.
+    Drain any pending worker status events and refresh the fixed lines.
+    Handles both start/end and progress events.
     """
-    while True:
-        try:
-            event = status_q.get_nowait()
-        except queue.Empty:
-            break
-        except (EOFError, OSError):
-            # Manager proxy can close unexpectedly, stop draining
-            break
-        except Exception:
-            # Be defensive, treat any proxy error as empty
-            break
+    try:
+        while True:
+            msg = status_q.get_nowait()
+            if not msg:
+                continue
 
-        evt_type, pid, kind, sample_id, fname, pointer = event
+            if msg[0] == "progress":
+                _, pid, event, kw = msg
+                if pid not in pid_to_slot:
+                    pid_to_slot[pid] = free_slots.pop(0) if free_slots else 0
+                slot = pid_to_slot[pid]
+                bar = worker_bars[slot]
 
-        # Assign a stable slot for this worker pid
-        if pid not in pid_to_slot:
-            if free_slots:
-                pid_to_slot[pid] = free_slots.pop(0)
-            else:
-                pid_to_slot[pid] = 0
-        slot = pid_to_slot[pid]
+                if event == "prepare":
+                    total = int(kw.get("total_attempts", 0)) or 1
+                    WORKER_TOTALS[pid] = total
+                    bar.reset(total=total)
+                    bar.n = 0
+                    # Preserve desc, append total
+                    bar.set_description_str(f'{bar.desc} - {total} attempts')
+                    bar.refresh()
+                elif event == "attempt":
+                    cur = int(kw.get("attempt", 0))
+                    total = WORKER_TOTALS.get(pid, bar.total or 1)
+                    cur = max(0, min(cur, total))
+                    bar.n = cur
+                    # Update desc with current attempt
+                    prefix = bar.desc.split(" - ")[0]
+                    bar.set_description_str(f'{prefix} - attempt {cur}/{total}')
+                    bar.refresh()
+                elif event == "done":
+                    total = WORKER_TOTALS.get(pid, bar.total or bar.n)
+                    bar.n = total
+                    prefix = bar.desc.split(" - ")[0]
+                    bar.set_description_str(f'{prefix} - done {total}/{total}')
+                    bar.refresh()
+                continue
 
-        if evt_type == "start":
-            label = _format_task_label(kind, sample_id, fname, pointer)
-            worker_bars[slot].set_description_str(f'Worker {slot+1}: {label}')
-            worker_bars[slot].refresh()
-        elif evt_type == "end":
-            worker_bars[slot].set_description_str(f'Worker {slot+1}: idle')
-            worker_bars[slot].refresh()
+            # Support older start/end messages if used
+            if msg[0] in ("start", "end"):
+                evt_type, pid, kind, sample_id, pin_id, cycle_key = msg
+                if pid not in pid_to_slot:
+                    pid_to_slot[pid] = free_slots.pop(0) if free_slots else 0
+                slot = pid_to_slot[pid]
+                if evt_type == "start":
+                    label = _format_task_label(sample_id, pin_id, cycle_key)
+                    worker_bars[slot].set_description_str(f'Worker {slot+1}: {label} - preparing')
+                    worker_bars[slot].reset(total=1)
+                    worker_bars[slot].n = 0
+                    worker_bars[slot].refresh()
+                else:
+                    worker_bars[slot].set_description_str(f'Worker {slot+1}: idle')
+                    worker_bars[slot].refresh()
+                continue
+    except queue.Empty:
+        return
 
 
-DEBUG_DASH = os.getenv("EIS_DASHBOARD_DEBUG") == "1"
+DEBUG_DASH = os.getenv("EIS_DASHBOARD_DEBUG", "0") == "1"
 
 def _fit_task(task):
-    kind, sample_id, fname, pointer, cycle_obj = task
+    """
+    Worker task. Returns a tuple the parent can merge:
+      ("key", sample_id, pin_id, cycle_key, fit_dict or None, error or None)
+    """
+    kind, sample_id, pin_id, cycle_key, cycle_obj = task
+
+    # Optionally send start message, parent will prefer progress messages
     try:
         if STATUS_QUEUE is not None:
-            STATUS_QUEUE.put(("start", os.getpid(), kind, sample_id, fname, pointer))
+            STATUS_QUEUE.put(("start", os.getpid(), kind, sample_id, pin_id, cycle_key))
         if DEBUG_DASH:
-            print(f"[DASH] start pid={os.getpid()} {sample_id} {fname} {pointer}", file=sys.stderr)
+            print(f"[DASH] start pid={os.getpid()} {sample_id} {pin_id} {cycle_key}", file=sys.stderr)
     except Exception:
         pass
 
     try:
         fit = fit_cycle_from_cycle_obj(cycle_obj)
-        return kind, sample_id, fname, pointer, fit, None
+        return kind, sample_id, pin_id, cycle_key, fit, None
     except Exception as exc:
-        return kind, sample_id, fname, pointer, None, str(exc)
+        return kind, sample_id, pin_id, cycle_key, None, str(exc)
     finally:
         try:
             if STATUS_QUEUE is not None:
-                STATUS_QUEUE.put(("end", os.getpid(), kind, sample_id, fname, pointer))
+                STATUS_QUEUE.put(("end", os.getpid(), kind, sample_id, pin_id, cycle_key))
             if DEBUG_DASH:
-                print(f"[DASH] end pid={os.getpid()} {sample_id} {fname} {pointer}", file=sys.stderr)
+                print(f"[DASH] end pid={os.getpid()} {sample_id} {pin_id} {cycle_key}", file=sys.stderr)
         except Exception:
             pass
-def enumerate_tasks(
-    eis_results: Dict[str, Any],
-    skip_existing: bool,
-    cycle_filter: Optional[Set[int]],
-    skip_by_pin_status: bool = False,  # default False; you can wire this to a CLI flag
-) -> List[Tuple[str, str, str, Any, Dict[str, Any]]]:
-    """
-    Create tasks across both JSON shapes:
-      - Case A: sample -> file -> cycle_data (list of cycles)
-      - Case B: sample -> pin -> cycle_N (keyed cycles)
-    Returns a list of tuples:
-      ("list", sample_id, file_id, idx, cycle_obj) or
-      ("key", sample_id, pin_id, cycle_key, cycle_obj)
-    """
-    tasks: List[Tuple[str, str, str, Any, Dict[str, Any]]] = []
 
+
+def build_tasks(eis_results: Dict[str, Any], skip_existing: bool) -> List[Tuple[str, str, str, Any, Dict[str, Any]]]:
+    """
+    Build worklist of keyed cycles for schema:
+      eis_results[sample_id][pin_id]["cycle_N"] = {...}
+    """
+    tasks_local: List[Tuple[str, str, str, Any, Dict[str, Any]]] = []
     for sample_id, sample in (eis_results or {}).items():
         if not isinstance(sample, dict):
             continue
-
-        # Iterate nested entries, which may be pins or files
-        for id2, entry in sample.items():
-            if not isinstance(entry, dict):
+        for pin_id, pin_entry in sample.items():
+            if not isinstance(pin_entry, dict):
                 continue
-
-            # Optional pin-level skip, off by default
-            if skip_by_pin_status:
-                pin_fitting = str(entry.get("fitting", "")).lower()
-                if skip_existing and pin_fitting == "ok":
-                    continue
-
-            # Case A: list style under 'cycle_data'
-            if isinstance(entry.get("cycle_data"), list):
-                for idx, c in enumerate(entry["cycle_data"]):
-                    if not isinstance(c, dict):
-                        continue
-                    if skip_existing and str(c.get("fit_status", "")).lower() == "ok":
-                        continue
-                    cidx = c.get("cycle") or c.get("cycle_index", idx)
-                    if cycle_filter is not None and int(cidx) not in cycle_filter:
-                        continue
-                    tasks.append(("list", sample_id, id2, idx, c))
-
-            # Case B: keyed cycles like 'cycle_1'
-            for key, c in entry.items():
-                if not isinstance(c, dict):
-                    continue
-                if not str(key).lower().startswith("cycle_"):
+            # Optional pin-level filter can be added here, e.g. pin_entry.get("fitting") == "ok"
+            for cycle_key, c in pin_entry.items():
+                if not (isinstance(c, dict) and str(cycle_key).lower().startswith("cycle_")):
                     continue
                 if skip_existing and str(c.get("fit_status", "")).lower() == "ok":
                     continue
-                cidx = c.get("cycle") or c.get("cycle_index") or _parse_cycle_index_from_key(key)
-                if cycle_filter is not None and (cidx is None or int(cidx) not in cycle_filter):
-                    continue
-                tasks.append(("key", sample_id, id2, key, c))
+                tasks_local.append(("key", sample_id, pin_id, cycle_key, c))
+    return tasks_local
 
-    return tasks
+
+def task_id(t: Tuple[str, str, str, Any, Dict[str, Any]]) -> Tuple[str, str, str, str]:
+    kind, sample_id, pin_id, cycle_key, _ = t
+    return (kind, sample_id, pin_id, str(cycle_key))
+
 
 def autoprocess_eis_json(
     json_path: str,
@@ -277,202 +248,226 @@ def autoprocess_eis_json(
     cleanup_intermediate: Optional[str] = None,
     jobs: Optional[int] = None,
     show_progress: bool = True,
+    retry_delay_sec: int = 200,
+    max_retries: int = 3,
 ) -> None:
     """
-    Autoprocess all cycles found in the input JSON, writing progress checkpoints and
-    a final output JSON. Shows a tqdm progress bar unless disabled.
-
-    Refactored to show a persistent dashboard of worker status lines, indicating
-    which file and cycle each process is currently handling.
+    Multi-pass scheduler:
+      - Build cycles
+      - Process in passes
+      - Defer failures to retry queue
+      - Wait retry_delay_sec between passes
+      - After max_retries, mark remaining as error retry_exceeded
     """
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     eis_results = data.get("eis_results", {}) or {}
 
-    # Build worklist of cycles
-    cycle_filter = build_cycle_index_filter(os.getenv("EIS_AUTOPROC_CYCLE_INDEX"))
-    # If you want a CLI flag, parse it and pass through instead of env
-    tasks = enumerate_tasks(
-        eis_results=eis_results,
-        skip_existing=skip_existing,
-        cycle_filter=cycle_filter,
-        skip_by_pin_status=False,  # leave False to avoid skipping whole pins
-    )
-    
-    # Optional visibility
-    print(
-        f"[INFO] samples={len(eis_results)}, cycles_to_process={len(tasks)}",
-        file=sys.stderr,
-    )
-    
-    if not tasks:
+    pending = build_tasks(eis_results, skip_existing=skip_existing)
+    if not pending:
         print("[INFO] No cycles require processing, exiting.", file=sys.stderr)
         atomic_write_json(out_path or json_path, data, fallback_path=cleanup_intermediate)
-        if cleanup_intermediate:
-            delete_if_exists(cleanup_intermediate)
-        if show_progress and pbar is not None:
-            pbar.close()
+        delete_if_exists(cleanup_intermediate)
         return
 
-    # Resolve jobs
-    if jobs is None:
-        env_jobs = os.getenv("EIS_AUTOPROC_JOBS")
-        jobs = int(env_jobs) if env_jobs else (os.cpu_count() or 1)
-    jobs = max(1, int(jobs))
+    retry_count: Dict[Tuple[str, str, str, str], int] = {}
+    pass_num = 0
 
-    # Create dashboard bars
-    pbar: Optional[tqdm] = None
-    worker_bars: List[tqdm] = []
-    pid_to_slot: Dict[int, int] = {}
-    free_slots: List[int] = []
+    while pending and pass_num < max_retries:
+        pass_num += 1
+        print(f"[INFO] Pass {pass_num}/{max_retries}, cycles={len(pending)}", file=sys.stderr)
 
-    if show_progress:
-        # Main progress bar, leave=True to keep the line on screen
-        pbar = tqdm(
-            total=len(tasks),
-            desc="Fitting cycles",
-            unit="cycle",
-            position=0,
-            leave=True,
-            dynamic_ncols=True
-        )
-        # Fixed worker status lines, one per job, leave=True for persistent lines
-        n_lines = max(1, jobs)
-        for i in range(n_lines):
-            wb = tqdm(
-                total=1,
-                position=i + 1,
+        # Resolve jobs
+        if jobs is None:
+            env_jobs = os.getenv("EIS_AUTOPROC_JOBS")
+            jobs_local = int(env_jobs) if env_jobs else (os.cpu_count() or 1)
+        else:
+            jobs_local = jobs
+        jobs_local = max(1, int(jobs_local))
+        
+        try:
+            # Sort by estimated cost: number of points in 'freq' or the first values list
+            pending.sort(
+                key=lambda t: len(
+                    (
+                        (t[4].get("data_array_values") or [[]])[0]
+                        or (t[4].get("values") or [[]])[0]
+                    )
+                ),
+                reverse=True,
+            )
+        except Exception:
+            pass
+
+        # Dashboard bars
+        pbar: Optional[tqdm] = None
+        worker_bars: List[tqdm] = []
+        pid_to_slot: Dict[int, int] = {}
+        free_slots: List[int] = []
+
+        if show_progress:
+            pbar = tqdm(
+                total=len(pending),
+                desc=f"Fitting cycles - pass {pass_num}",
+                unit="cycle",
+                position=0,
                 leave=True,
-                bar_format='{desc}',
                 dynamic_ncols=True
             )
-            wb.set_description_str(f'Worker {i+1}: idle')
-            worker_bars.append(wb)
-        free_slots = list(range(n_lines))
+            for i in range(jobs_local):
+                wb = tqdm(total=1, position=i + 1, leave=True, dynamic_ncols=True, bar_format='{desc}')
+                wb.set_description_str(f'Worker {i+1}: idle')
+                worker_bars.append(wb)
+            free_slots = list(range(len(worker_bars)))
 
-    processed = 0
-    failed = 0
+        processed = 0
+        deferred = 0
+        next_pending: List[Tuple[str, str, str, Any, Dict[str, Any]]] = []
 
-    if jobs == 1:
-    # Sequential
-        for i, t in enumerate(tasks):
-            kind, sample_id, fname, pointer, cycle_obj = t
-    
-            # Show start on the single worker line
-            if show_progress and worker_bars:
-                label = _format_task_label(kind, sample_id, fname, pointer)
-                worker_bars[0].set_description_str(f'Worker 1: {label}')
-                worker_bars[0].refresh()
-    
-            # Execute task
-            kind, sample_id, fname, pointer, fit, err = _fit_task(t)
-    
-            # Merge results
-            if fit:
-                data["eis_results"][sample_id][fname][pointer].update(fit)
-                processed += 1
-            else:
-                data["eis_results"][sample_id][fname][pointer]["fit_status"] = "error"
-                data["eis_results"][sample_id][fname][pointer]["fit_error"] = err
-                failed += 1
-    
-            if show_progress and pbar is not None:
-                pbar.update(1)
-                worker_bars[0].set_description_str('Worker 1: idle')
-                worker_bars[0].refresh()
-    
-            # Checkpoint
-            if processed > 0 and (processed % checkpoint_interval == 0 or i == len(tasks) - 1):
-                atomic_write_json(out_path or json_path, data)
-                if show_progress:
-                    tqdm.write(f"[INFO] Checkpoint saved after {processed} processed cycles to {out_path or json_path}")
-    
-    else:
-        # Parallel
-        print(f"[INFO] Fitting {len(tasks)} cycles with {jobs} processes", file=sys.stderr)
-        ctx = mp.get_context("spawn")
-        chunksize = 1  # responsive
-    
-        manager = mp.Manager()
-        status_q = ctx.SimpleQueue()
-    
-        # Status updater thread
-        stop_event = threading.Event()
-        updater = None
-        if show_progress:
-            updater = threading.Thread(
-                target=_run_status_updater,
-                args=(stop_event, status_q, worker_bars, pid_to_slot, free_slots),
-                daemon=True,
-            )
-            updater.start()
-    
-        with ctx.Pool(
-            processes=jobs,
-            initializer=_init_worker,
-            initargs=(status_q,),
-            maxtasksperchild=50
-        ) as pool:
-            for i, res in enumerate(pool.imap_unordered(_fit_task, tasks, chunksize=chunksize)):
-                kind, sample_id, fname, pointer, fit, err = res
-    
+        if jobs_local == 1:
+            # Sequential
+            for i, t in enumerate(pending):
+                kind, sample_id, pin_id, cycle_key, cycle_obj = t
+                if show_progress and worker_bars:
+                    label = _format_task_label(sample_id, pin_id, cycle_key)
+                    worker_bars[0].set_description_str(f'Worker 1: {label} - preparing')
+                    worker_bars[0].reset(total=1)
+                    worker_bars[0].n = 0
+                    worker_bars[0].refresh()
+
+                kind, sample_id, pin_id, cycle_key, fit, err = _fit_task(t)
+
                 if fit:
-                    data["eis_results"][sample_id][fname][pointer].update(fit)
+                    data["eis_results"][sample_id][pin_id][cycle_key].update(fit)
                     processed += 1
                 else:
-                    data["eis_results"][sample_id][fname][pointer]["fit_status"] = "error"
-                    data["eis_results"][sample_id][fname][pointer]["fit_error"] = err
-                    failed += 1
-    
-                if show_progress and pbar is not None:
+                    # Defer problematic cycle
+                    next_pending.append(t)
+                    tk = task_id(t)
+                    retry_count[tk] = retry_count.get(tk, 0) + 1
+                    data["eis_results"][sample_id][pin_id][cycle_key]["fit_status"] = "error"
+                    data["eis_results"][sample_id][pin_id][cycle_key]["fit_error"] = str(err)
+                    deferred += 1
+
+                if pbar is not None:
                     pbar.update(1)
-    
-                if processed > 0 and (processed % checkpoint_interval == 0 or i == len(tasks) - 1):
-                    atomic_write_json(out_path or json_path, data)
+                    worker_bars[0].set_description_str('Worker 1: idle')
+                    worker_bars[0].refresh()
+
+                if processed > 0 and (processed % checkpoint_interval == 0 or i == len(pending) - 1):
+                    atomic_write_json(out_path or json_path, data, fallback_path=cleanup_intermediate)
                     if show_progress:
-                        tqdm.write(f"[INFO] Checkpoint saved after {processed} processed cycles to {out_path or json_path}")
-    
-        # Stop updater thread
-        if updater:
-            stop_event.set()
-            updater.join(timeout=1.0)
+                        tqdm.write(f"[INFO] Checkpoint saved after {processed} cycles")
 
-    checkpoint_target = cleanup_intermediate
-    
-    # Checkpoints
-    atomic_write_json(out_path or json_path, data, fallback_path=checkpoint_target)
-    
-    # Final write
-    ok = atomic_write_json(out_path or json_path, data, fallback_path=checkpoint_target)
-    if ok and cleanup_intermediate:
-        delete_if_exists(cleanup_intermediate)
+        else:
+            # Parallel
+            print(f"[INFO] Fitting {len(pending)} cycles with {jobs_local} processes", file=sys.stderr)
+            ctx = mp.get_context("spawn")
+            chunksize = 1
 
-    if show_progress:
-        # Ensure status lines show idle at end and then close bars
-        for i, wb in enumerate(worker_bars):
-            wb.set_description_str(f'Worker {i+1}: idle')
-            wb.refresh()
-        if pbar is not None:
-            pbar.close()
-        for wb in worker_bars:
-            wb.close()
+            status_q = ctx.Queue()
+            stop_event = threading.Event()
+            updater = None
+            if show_progress:
+                updater = threading.Thread(
+                    target=_run_status_updater,
+                    args=(stop_event, status_q, worker_bars, pid_to_slot, free_slots),
+                    daemon=True,
+                )
+                updater.start()
 
-    print(f"[INFO] cycles_total={len(tasks)}, processed={processed}, failed={failed}, out={out_path or json_path}")
+            with ctx.Pool(
+                processes=jobs_local,
+                initializer=_init_worker,
+                initargs=(status_q,),
+                maxtasksperchild=50
+            ) as pool:
+                for i, res in enumerate(pool.imap_unordered(_fit_task, pending, chunksize=chunksize)):
+                    kind, sample_id, pin_id, cycle_key, fit, err = res
+
+                    if fit:
+                        data["eis_results"][sample_id][pin_id][cycle_key].update(fit)
+                        processed += 1
+                    else:
+                        t_defer = ("key", sample_id, pin_id, cycle_key, data["eis_results"][sample_id][pin_id][cycle_key])
+                        next_pending.append(t_defer)
+                        tk = task_id(t_defer)
+                        retry_count[tk] = retry_count.get(tk, 0) + 1
+                        data["eis_results"][sample_id][pin_id][cycle_key]["fit_status"] = "error"
+                        data["eis_results"][sample_id][pin_id][cycle_key]["fit_error"] = str(err)
+                        deferred += 1
+
+                    if pbar is not None:
+                        pbar.update(1)
+
+                    if processed > 0 and (processed % checkpoint_interval == 0 or i == len(pending) - 1):
+                        atomic_write_json(out_path or json_path, data, fallback_path=cleanup_intermediate)
+                        if show_progress:
+                            tqdm.write(f"[INFO] Checkpoint saved after {processed} cycles")
+
+            if updater:
+                stop_event.set()
+                updater.join(timeout=1.0)
+
+        # Final write per pass
+        atomic_write_json(out_path or json_path, data, fallback_path=cleanup_intermediate)
+        if show_progress:
+            for i, wb in enumerate(worker_bars):
+                wb.set_description_str(f'Worker {i+1}: idle')
+                wb.refresh()
+            if pbar is not None:
+                pbar.close()
+            for wb in worker_bars:
+                wb.close()
+
+        print(f"[INFO] pass={pass_num}, processed={processed}, deferred={deferred}, out={out_path or json_path}", file=sys.stderr)
+
+        # If there are deferred cycles and we still have retries left, wait and retry
+        if next_pending and pass_num < max_retries:
+            print(f"[INFO] Waiting {retry_delay_sec} seconds before retrying {len(next_pending)} cycles", file=sys.stderr)
+            time.sleep(retry_delay_sec)
+            pending = next_pending
+        else:
+            pending = next_pending
+
+    # After max_retries, mark remaining as final errors
+    if pending:
+        print(f"[WARN] {len(pending)} cycles still failing after {max_retries} passes, marking as error", file=sys.stderr)
+        for t in pending:
+            kind, sample_id, pin_id, cycle_key, cycle_obj = t
+            cycle_obj["fit_status"] = "error"
+            prev_err = str(cycle_obj.get("fit_error", ""))
+            cycle_obj["fit_error"] = f"{prev_err}; retry_exceeded"
+        atomic_write_json(out_path or json_path, data, fallback_path=cleanup_intermediate)
+
     delete_if_exists(cleanup_intermediate)
+    print(f"[INFO] done, out={out_path or json_path}")
+
+
+def _run_status_updater(stop_event, status_q, worker_bars, pid_to_slot, free_slots):
+    """
+    Continuously drain the status queue and refresh worker status lines.
+    Runs until stop_event is set.
+    """
+    while not stop_event.is_set():
+        _drain_status_queue(status_q, worker_bars, pid_to_slot, free_slots)
+        time.sleep(0.1)  # 100 ms refresh cadence
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Autoprocess EIS JSON, keyed cycles under pin entries, with progress bar and parallelization."
+        description="Autoprocess EIS JSON, keyed cycles under pin entries, multi-pass with retries, and progress dashboard."
     )
     parser.add_argument("--json", required=True, help="Path to input JSON, updated in place by default")
     parser.add_argument("--out", help="Optional output JSON path, defaults to input")
     parser.add_argument("--no-skip", action="store_true", help="Recompute even if fit_status is ok")
-    parser.add_argument("--cleanup", help="Optional path of intermediate JSON to delete after success")
+    parser.add_argument("--cleanup", help="Optional checkpoint JSON path to use when target is locked")
     parser.add_argument("--checkpoint", type=int, default=20, help="Checkpoint interval in processed cycles")
     parser.add_argument("--jobs", type=int, help="Processes to use, default CPU count")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress bar")
+    parser.add_argument("--retry-delay", type=int, default=200, help="Seconds to wait between retry passes")
+    parser.add_argument("--max-retries", type=int, default=3, help="Maximum retry passes for problematic cycles")
     args = parser.parse_args()
 
     mp.freeze_support()
@@ -485,6 +480,8 @@ def main():
         cleanup_intermediate=args.cleanup,
         jobs=args.jobs,
         show_progress=not args.no_progress,
+        retry_delay_sec=args.retry_delay,
+        max_retries=args.max_retries,
     )
 
 

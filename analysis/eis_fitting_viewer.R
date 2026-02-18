@@ -1,679 +1,1085 @@
 #!/usr/bin/env Rscript
-# eis_fitting_viewer_modular.R
 
 suppressPackageStartupMessages({
   library(shiny)
-  library(jsonlite)
+  library(shinyjs)
   library(dplyr)
+  library(tidyr)
+  library(tibble)
   library(purrr)
   library(plotly)
-  library(stringr)
+  library(gt)
   library(viridisLite)
-  library(DT)
-  library(tidyr)
+  library(jsonlite)
 })
-json_path <- "~/Git/SPOC_code/data/SPOC_battery.json"
-# -----------------------------
-# Args and basic helpers
-# -----------------------------
-# args <- commandArgs(trailingOnly = TRUE)
-# if (length(args) == 0) stop("Please provide the path to your JSON as a command-line argument.")
-# json_path <- args[1]
-# if (!file.exists(json_path)) stop(paste("File not found:", json_path))
 
+# =============================================================================
+# UTILITIES
+# =============================================================================
 `%||%` <- function(x, y) if (!is.null(x)) x else y
-
-idx_of <- function(vars, name) {
-  vars_chr <- as.character(vars)
-  idx <- which(vars_chr == name)
-  if (length(idx) == 1) idx else NA_integer_
+null_if_empty <- function(x) if (is.list(x) && length(x) == 0) NULL else x
+scalar1 <- function(x) {
+  x <- null_if_empty(x)
+  if (is.null(x) || length(x) == 0) return(NA)
+  if (is.list(x)) x <- x[[1]]
+  if (length(x) == 0) return(NA)
+  x[1]
 }
 
-# -----------------------------
-# Styling constants
-# -----------------------------
-raw_color <- "#1f4e79"   # dark blue
-fit_color <- "#ff8c00"   # orange
-marker_style <- list(color = raw_color, symbol = "circle", size = 8)
-line_style   <- list(color = fit_color, width = 2, dash = "dash")
-
-# -----------------------------
-# JSON loading and tidying
-# -----------------------------
-load_json <- function(path) {
-  fromJSON(path, simplifyVector = FALSE)
+# =============================================================================
+# JSON LOADING - jsonlite only
+# =============================================================================
+read_file_text <- function(p) {
+  con <- if (grepl("\\.gz$", p, ignore.case = TRUE)) gzfile(p, "rt") else file(p, "rt")
+  on.exit(close(con), add = TRUE)
+  paste(readLines(con, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
 }
 
-get_raw_arrays <- function(cycle) {
-  vars <- cycle$data_array_variables %||% cycle$data_array_variable
-  vals <- cycle$data_array_values %||% cycle$data_array_value
-  list(vars = vars, vals = vals)
-}
-
-get_fit_arrays <- function(cycle) {
-  # Prefer new schema fit_value_arrays when present
-  if (!is.null(cycle$fit_value_arrays)) {
-    vars <- cycle$fit_value_arrays$variables %||% cycle$fit_value_arrays[["variables"]]
-    vals <- cycle$fit_value_arrays$values %||% cycle$fit_value_arrays[["values"]]
-    if (!is.null(vars) && !is.null(vals)) return(list(vars = vars, vals = vals))
+sanitize_json_text <- function(txt, sanitize_non_standard = FALSE) {
+  txt <- sub("^\uFEFF", "", txt)
+  if (isTRUE(sanitize_non_standard)) {
+    txt <- gsub("\\b(NaN|Infinity|-Inf|Inf|NA|Undefined)\\b", "null", txt, ignore.case = TRUE)
   }
-  # Fallback to provided example schema
-  vars <- cycle$fit_array_variables %||% cycle$all_variables
-  vals <- cycle$fit_array_values %||% cycle$all_values
-  list(vars = vars, vals = vals)
+  txt
 }
 
-extract_cycle_df <- function(sample_id, sample_meta, pin_key, pin_entry, cycle_obj) {
-  raw_arrays <- get_raw_arrays(cycle_obj)
-  fit_arrays <- get_fit_arrays(cycle_obj)
+load_json <- function(path, sanitize_non_standard = FALSE) {
+  if (is.na(path) || !nzchar(path)) return(list())
+  if (!file.exists(path)) stop(sprintf("File not found: %s", path))
+  txt <- read_file_text(path)
+  txt <- sanitize_json_text(txt, sanitize_non_standard)
+  jsonlite::fromJSON(
+    txt,
+    simplifyVector = TRUE,
+    simplifyDataFrame = TRUE,
+    simplifyMatrix = TRUE,
+    flatten = FALSE
+  )
+}
+
+# Separate, explicit loaders so you can do slow reads once
+load_meta_json <- function(path) {
+  load_json(path, sanitize_non_standard = FALSE)
+}
+
+load_eis_json <- function(path) {
+  # EIS sources often contain non standard literals, sanitize them
+  load_json(path, sanitize_non_standard = TRUE)
+}
+
+# =============================================================================
+# SAMPLE RESOLUTION AND MERGE
+# =============================================================================
+resolve_sample_map <- function(x) {
+  if (is.null(x) || !is.list(x)) return(list())
   
-  pin_num     <- pin_entry$pin %||% NA
-  file_name   <- pin_entry$file_name %||% pin_key
-  cycle_index <- cycle_obj$cycle %||% NA
-  
-  comp <- list(
-    cast_type = sample_meta$print_quality$cast_type %||% NA,
-    date_casted = sample_meta$print_quality$date_casted %||% NA,
-    area_cm2 = sample_meta$print_quality$area_cm2 %||% NA,
-    fcomp_mat1 = sample_meta$fcomp_mat1 %||% NA,
-    fcomp_mat2 = sample_meta$fcomp_mat2 %||% NA,
-    fcomp_mat1_ratio = sample_meta$fcomp_mat1_ratio %||% NA,
-    fcomp_mat2_ratio = sample_meta$fcomp_mat2_ratio %||% NA,
-    fcomp_additive = sample_meta$fcomp_additive %||% NA,
-    fcomp_additive_wt_pct = sample_meta$fcomp_additive_wt_pct %||% NA,
-    fcomp_salt = sample_meta$fcomp_salt %||% NA,
-    fcomp_salt_wt_pct = sample_meta$fcomp_salt_wt_pct %||% NA,
-    fcomp_inhibitor = sample_meta$fcomp_inhibitor %||% NA,
-    fcomp_inhibitor_wt_pct = sample_meta$fcomp_inhibitor_wt_pct %||% NA,
-    fcomp_formulation = sample_meta$fcomp_formulation %||% NA
+  candidates <- list(
+    x$samples,
+    x$eis_results,
+    x$data$samples,
+    if (!is.null(names(x)) && all(vapply(x, is.list, logical(1)))) x else NULL
   )
   
-  # Raw
-  raw_df <- NULL
-  if (!is.null(raw_arrays$vars) && !is.null(raw_arrays$vals)) {
-    v <- raw_arrays$vars; a <- raw_arrays$vals
-    i_freq <- idx_of(v, "freq")
-    i_Re   <- idx_of(v, "Re")
-    i_Im   <- idx_of(v, "Im")
-    i_Z    <- idx_of(v, "Z")
-    i_Ph   <- idx_of(v, "Phase")
-    
-    valid <- all(!is.na(c(i_freq, i_Re, i_Im)))
-    if (valid) {
-      n <- length(a[[i_freq]])
-      rr <- as.numeric(a[[i_Re]])[seq_len(n)]
-      ri <- as.numeric(a[[i_Im]])[seq_len(n)]
-      raw_df <- tibble(
-        freq    = as.numeric(a[[i_freq]]),
-        Raw_Re  = rr,
-        Raw_Im  = ri,
-        Raw_Z   = if (!is.na(i_Z)) as.numeric(a[[i_Z]])[seq_len(n)] else sqrt(rr^2 + ri^2),
-        Raw_Ph  = if (!is.na(i_Ph)) as.numeric(a[[i_Ph]])[seq_len(n)] else atan2(ri, rr) * 180 / pi,
-        type    = "Raw",
-        sample_id = sample_id,
-        pin = pin_num,
-        pin_key = pin_key,
-        file_name = file_name,
-        cycle_index = cycle_index,
-        cast_type = comp$cast_type,
-        date_casted = comp$date_casted,
-        area_cm2 = comp$area_cm2,
-        fcomp_mat1 = comp$fcomp_mat1,
-        fcomp_mat2 = comp$fcomp_mat2,
-        fcomp_mat1_ratio = comp$fcomp_mat1_ratio,
-        fcomp_mat2_ratio = comp$fcomp_mat2_ratio,
-        fcomp_additive = comp$fcomp_additive,
-        fcomp_additive_wt_pct = comp$fcomp_additive_wt_pct,
-        fcomp_salt = comp$fcomp_salt,
-        fcomp_salt_wt_pct = comp$fcomp_salt_wt_pct,
-        fcomp_inhibitor = comp$fcomp_inhibitor,
-        fcomp_inhibitor_wt_pct = comp$fcomp_inhibitor_wt_pct,
-        fcomp_formulation = comp$fcomp_formulation
-      )
+  purrr::detect(candidates, ~ !is.null(.x) && is.list(.x)) %||% list()
+}
+
+# =============================================================================
+# PIN/CYCLE NORMALIZATION
+# =============================================================================
+# Heuristic, recognizes common pin key patterns
+is_pin_key <- function(nm) {
+  grepl("^(pin_?\\d+|P\\d+)$", nm, ignore.case = TRUE)
+}
+
+normalize_pin_entry <- function(pin_obj, key = NULL) {
+  # Handle atomic vectors gracefully
+  if (!is.list(pin_obj)) {
+    return(list(
+      pin = suppressWarnings(as.integer(gsub("\\D+", "", key))) %||% NA_integer_,
+      file_name = key %||% NA_character_,
+      cycle_data = list()
+    ))
+  }
+  
+  # Safe accessor
+  get_field <- function(obj, ...) {
+    fields <- list(...)
+    for (field in fields) {
+      val <- obj[[field]]
+      if (!is.null(val)) return(val)
+    }
+    NULL
+  }
+  
+  pin_val  <- get_field(pin_obj, "pin", "pin_id", "pinNumber") %||%
+    suppressWarnings(as.integer(gsub("\\D+", "", key)))
+  file_val <- get_field(pin_obj, "file_name", "file", "mpr", "filePath") %||% key
+  
+  # Known cycle containers
+  cycles <- get_field(pin_obj, "cycle_data", "cycles", "eis_cycles")
+  
+  # Handle cycle_* named lists
+  if (is.null(cycles) || length(cycles) == 0) {
+    cycle_keys <- names(pin_obj)
+    if (!is.null(cycle_keys) && length(cycle_keys)) {
+      hits <- grep("^cycle_\\d+$", cycle_keys, value = TRUE)
+      if (length(hits) > 0) {
+        nums <- suppressWarnings(as.integer(sub("^cycle_", "", hits)))
+        ord  <- order(nums)
+        cycles <- purrr::map2(pin_obj[hits][ord], nums[ord], function(obj, num) {
+          obj <- if (is.list(obj)) obj else list()
+          if (is.null(obj$cycle)) obj$cycle <- num
+          obj
+        })
+      }
     }
   }
   
-  # Fit
-  fit_df <- NULL
-  if (!is.null(fit_arrays$vars) && !is.null(fit_arrays$vals)) {
-    v <- fit_arrays$vars; a <- fit_arrays$vals
-    i_freq <- idx_of(v, "freq")
-    i_FRe <- idx_of(v, "Z_pred_real") %||% idx_of(v, "Re")
-    i_FIm <- idx_of(v, "Z_pred_imag") %||% idx_of(v, "Im")
-    i_MRe <- idx_of(v, "Z_measured_real")
-    i_MIm <- idx_of(v, "Z_measured_imag")
+  # Heuristic: if remaining elements look like cycles, treat them as such
+  if (is.null(cycles) || length(cycles) == 0) {
+    cycles <- list()
+  } else {
+    nm <- names(cycles)
+    cycles <- purrr::imap(cycles, function(cyc, i) {
+      cyc <- if (is.list(cyc)) cyc else list()
+      # Fill cycle if missing, prefer numeric part of the name, otherwise index
+      if (is.null(cyc$cycle)) {
+        if (!is.null(nm) && length(nm) >= i && nzchar(nm[[i]])) {
+          nn <- suppressWarnings(as.integer(gsub("\\D+", "", nm[[i]])))
+          cyc$cycle <- if (!is.na(nn)) nn else as.integer(i)
+        } else {
+          cyc$cycle <- as.integer(i)
+        }
+      }
+      cyc$eis_flag <- isTRUE(cyc$eis_flag)
+      cyc$eis_note <- cyc$eis_note %||% ""
+      cyc
+    })
+  }
+  
+  list(
+    pin = pin_val %||% NA_integer_,
+    file_name = file_val %||% key,
+    cycle_data = cycles
+  )
+}
+
+build_pin_map <- function(sample_eis) {
+  empty <- list(keys = character(), map = list())
+  if (is.null(sample_eis) || !is.list(sample_eis)) return(empty)
+  
+  ensure_names <- function(xs) {
+    nm <- names(xs)
+    if (is.null(nm)) nm <- rep("", length(xs))
+    missing <- is.na(nm) | nm == ""
+    if (any(missing)) nm[missing] <- sprintf("pin_%04d", which(missing))
+    names(xs) <- nm
+    xs
+  }
+  
+  # Convert a data.frame with pin-like columns into a list-of-pins
+  df_to_pin_list <- function(df) {
+    if (!is.data.frame(df)) return(NULL)
+    nm <- names(df)
+    if (is.null(nm) || !length(nm)) return(NULL)
     
-    valid <- all(!is.na(c(i_freq, i_FRe, i_FIm)))
-    if (valid) {
-      n <- length(a[[i_freq]])
-      fr <- as.numeric(a[[i_FRe]])[seq_len(n)]
-      fi <- as.numeric(a[[i_FIm]])[seq_len(n)]
-      mr <- if (!is.na(i_MRe)) as.numeric(a[[i_MRe]])[seq_len(n)] else NA_real_
-      mi <- if (!is.na(i_MIm)) as.numeric(a[[i_MIm]])[seq_len(n)] else NA_real_
-      fit_df <- tibble(
-        freq    = as.numeric(a[[i_freq]]),
-        Fit_Re  = fr,
-        Fit_Im  = fi,
-        Fit_Z   = sqrt(fr^2 + fi^2),
-        Fit_Ph  = atan2(fi, fr) * 180 / pi,
-        Meas_Re = mr,
-        Meas_Im = mi,
-        Meas_Z  = if (!all(is.na(mr)) && !all(is.na(mi))) sqrt(mr^2 + mi^2) else NA_real_,
-        Meas_Ph = if (!all(is.na(mr)) && !all(is.na(mi))) atan2(mi, mr) * 180 / pi else NA_real_,
-        type    = "Fit",
-        sample_id = sample_id,
-        pin = pin_num,
-        pin_key = pin_key,
-        file_name = file_name,
-        cycle_index = cycle_index,
-        cast_type = comp$cast_type,
-        date_casted = comp$date_casted,
-        area_cm2 = comp$area_cm2,
-        fcomp_mat1 = comp$fcomp_mat1,
-        fcomp_mat2 = comp$fcomp_mat2,
-        fcomp_mat1_ratio = comp$fcomp_mat1_ratio,
-        fcomp_mat2_ratio = comp$fcomp_mat2_ratio,
-        fcomp_additive = comp$fcomp_additive,
-        fcomp_additive_wt_pct = comp$fcomp_additive_wt_pct,
-        fcomp_salt = comp$fcomp_salt,
-        fcomp_salt_wt_pct = comp$fcomp_salt_wt_pct,
-        fcomp_inhibitor = comp$fcomp_inhibitor,
-        fcomp_inhibitor_wt_pct = comp$fcomp_inhibitor_wt_pct,
-        fcomp_formulation = comp$fcomp_formulation
-      )
+    pin_cols <- nm[is_pin_key(nm)]
+    if (length(pin_cols)) {
+      rn <- rownames(df)
+      out <- df[pin_cols] |>
+        purrr::imap(~ {
+          v <- if (is.list(.x)) .x else as.list(.x)
+          cur <- names(v)
+          if (!is.null(rn) && length(v) == length(rn) &&
+              (is.null(cur) || any(cur == "" | is.na(cur)))) {
+            names(v) <- rn
+          }
+          v
+        })
+      return(out)
+    }
+    
+    # Single pin shape: rows are cycles with list-columns
+    if (any(c("data_array_values","data_array_variables",
+              "fit_array_values","fit_array_variables",
+              "all_values","all_variables") %in% nm)) {
+      rows_as_cycles <- purrr::pmap(as.list(df), ~ list(...))
+      return(list(pin_0001 = rows_as_cycles))
+    }
+    
+    NULL
+  }
+  
+  # Scopes to try: itself, one-level unwrap, and direct list/data.frame children
+  get_scopes <- function(x) {
+    unwrap <- if (is.list(x) && length(x) == 1 && is.list(x[[1]])) list(x[[1]]) else list()
+    children <- if (is.list(x)) purrr::keep(x, ~ is.list(.x) || is.data.frame(.x)) else list()
+    c(list(x), unwrap, children)
+  }
+  
+  from_df_cols <- function(scope) df_to_pin_list(scope)
+  
+  from_known <- function(scope) {
+    if (!is.list(scope) || is.data.frame(scope)) return(NULL)
+    nms <- names(scope)
+    if (is.null(nms)) return(NULL)
+    keys <- c("eis_results","pins","eis","eisdata","results")
+    hits <- which(tolower(nms) %in% keys)
+    hits |>
+      purrr::map(~ scope[[.x]]) |>
+      purrr::map(~ if (is.data.frame(.x)) df_to_pin_list(.x)
+                 else if (is.list(.x) && length(.x)) .x
+                 else NULL) |>
+      purrr::compact() |>
+      purrr::pluck(1, .default = NULL)
+  }
+  
+  from_top_level_pins <- function(scope) {
+    if (!is.list(scope) || is.data.frame(scope)) return(NULL)
+    nms <- names(scope)
+    if (is.null(nms)) return(NULL)
+    pins <- nms[is_pin_key(nms)]
+    if (length(pins)) scope[pins] else NULL
+  }
+  
+  extractors <- list(from_df_cols, from_known, from_top_level_pins)
+  
+  container <-
+    get_scopes(sample_eis) |>
+    purrr::map(\(scope)
+               purrr::reduce(extractors, .init = NULL, .f = \(acc, ext) if (!is.null(acc)) acc else ext(scope))
+    ) |>
+    purrr::compact() |>
+    purrr::pluck(1, .default = NULL)
+  
+  if (is.null(container) || !length(container)) return(empty)
+  container <- ensure_names(container)
+  
+  normalized <- purrr::imap(container, ~ {
+    pin <- if (is.list(.x)) .x else as.list(.x)
+    normalize_pin_entry(pin_obj = pin, key = .y)
+  })
+  
+  list(keys = names(normalized), map = normalized)
+}
+
+combine_eis_meta <- function(meta_json, eis_json) {
+  meta_samples <- resolve_sample_map(meta_json)
+  eis_samples  <- resolve_sample_map(eis_json)
+  sample_ids   <- union(names(meta_samples), names(eis_samples))
+  
+  samples_merged <- purrr::map(purrr::set_names(sample_ids), function(sid) {
+    sm <- meta_samples[[sid]] %||% list()
+    se <- eis_samples[[sid]] %||% list()
+    
+    # Prefer explicit EIS structure when present
+    if (!is.null(se) && length(se) > 0) {
+      pin_map <- build_pin_map(se)
+      if (length(pin_map$map) > 0) sm$eis_results <- pin_map$map
+    }
+    
+    # If no eis_results yet, see if the meta side itself embeds EIS that we can normalize
+    if (is.null(sm$eis_results) || !length(sm$eis_results)) {
+      pin_map <- build_pin_map(sm)
+      if (length(pin_map$map) > 0) sm$eis_results <- pin_map$map
+    }
+    
+    sm
+  })
+  
+  list(samples = samples_merged)
+}
+
+# =============================================================================
+# DATA EXTRACTION
+# =============================================================================
+
+to_num_vec <- function(x) {
+  if (is.null(x)) return(numeric())
+  as.numeric(unlist(x, recursive = TRUE, use.names = FALSE))
+}
+
+idx_of_first <- function(vars, name) {
+  if (is.null(vars)) return(NA_integer_)
+  v <- vars
+  if (is.list(v)) v <- unlist(v, recursive = TRUE, use.names = FALSE)
+  v <- as.character(v)
+  match(name, v, nomatch = NA_integer_)
+}
+
+pull_var <- function(values, vars, name, synonyms = NULL) {
+  if (is.null(values)) return(numeric())
+  candidates <- unique(c(name, synonyms %||% character()))
+  
+  # named list
+  if (is.list(values) && !is.null(names(values))) {
+    nm <- names(values)
+    hit <- candidates[candidates %in% nm]
+    if (length(hit)) return(to_num_vec(values[[hit[1]]]))
+  }
+  
+  # data.frame
+  if (is.data.frame(values)) {
+    nm <- colnames(values)
+    hit <- candidates[candidates %in% nm]
+    if (length(hit)) return(to_num_vec(values[[hit[1]]]))
+  }
+  
+  # flat numeric vector that can be reshaped by vars
+  if (is.atomic(values) && is.numeric(values) && !is.null(vars)) {
+    vv <- vars
+    if (is.list(vv)) vv <- unlist(vv, recursive = TRUE, use.names = FALSE)
+    vv <- as.character(vv)
+    k <- length(vv)
+    if (k > 0 && length(values) %% k == 0) {
+      mat <- matrix(values, ncol = k, byrow = TRUE)
+      colnames(mat) <- vv
+      df <- as.data.frame(mat, check.names = FALSE)
+      if (name %in% names(df)) return(to_num_vec(df[[name]]))
+      hit <- candidates[candidates %in% names(df)]
+      if (length(hit)) return(to_num_vec(df[[hit[1]]]))
     }
   }
   
-  bind_rows(raw_df, fit_df)
+  # positional list-of-arrays
+  if (is.list(values)) {
+    vv <- vars
+    if (is.list(vv)) vv <- unlist(vv, recursive = TRUE, use.names = FALSE)
+    vv <- as.character(vv)
+    hit_name <- candidates[candidates %in% vv]
+    idx <- if (length(hit_name)) match(hit_name[1], vv) else idx_of_first(vv, name)
+    if (!is.na(idx) && idx >= 1 && idx <= length(values)) {
+      return(to_num_vec(values[[idx]]))
+    }
+  }
+  
+  numeric()
+}
+
+merge_meta_eis <- function(meta_json, eis_json) {
+  meta_samples <- resolve_sample_map(meta_json)
+  eis_samples  <- resolve_sample_map(eis_json)
+  sample_ids   <- union(names(meta_samples), names(eis_samples))
+  
+  samples_merged <- purrr::map(setNames(sample_ids, sample_ids), function(sid) {
+    sm <- meta_samples[[sid]] %||% list()
+    se <- eis_samples[[sid]] %||% list()
+    
+    # Build pin map from the EIS payload for this sample
+    pin_map <- build_pin_map(se)
+    if (length(pin_map$map) > 0) {
+      sm$eis_results <- pin_map$map
+    } else if (is.list(se$eis_results) && length(se$eis_results) > 0) {
+      # If already normalized in payload, keep as is
+      sm$eis_results <- se$eis_results
+    }
+    
+    sm
+  })
+  
+  list(samples = samples_merged)
+}
+
+extract_cycle_rows <- function(sample_id, sample_meta, pin_key, pin_entry, cycle_obj) {
+  if (!is.list(cycle_obj)) return(tibble())
+  
+  # Containers
+  v_raw <- cycle_obj$data_array_variables %||% cycle_obj$data_array_variable
+  a_raw <- cycle_obj$data_array_values   %||% cycle_obj$data_array_value
+  
+  v_fit <- cycle_obj$fit_array_variables %||% cycle_obj$all_variables
+  a_fit <- cycle_obj$fit_array_values    %||% cycle_obj$all_values
+  
+  syn <- list(
+    freq  = c("freq", "frequency", "f"),
+    Re    = c("Re", "Z_real", "real", "realZ"),
+    Im    = c("Im", "Z_imag", "imag", "imagZ"),
+    Z     = c("Z", "mag", "|Z|", "absZ", "Z_mag", "Magnitude"),
+    Phase = c("Phase", "phase", "phi", "angle", "theta", "Phase_deg", "phase_deg"),
+    
+    Fit_Re  = c("Z_pred_real", "Re_fit", "Re_pred", "Zfit_real"),
+    Fit_Im  = c("Z_pred_imag", "Im_fit", "Im_pred", "Zfit_imag"),
+    Meas_Re = c("Z_measured_real", "Re_meas", "Re_measured"),
+    Meas_Im = c("Z_measured_imag", "Im_meas", "Im_measured")
+  )
+  
+  # Pull raw arrays
+  freq   <- pull_var(a_raw, v_raw, "freq",  syn$freq)
+  Raw_Re <- pull_var(a_raw, v_raw, "Re",    syn$Re)
+  Raw_Im <- pull_var(a_raw, v_raw, "Im",    syn$Im)
+  Raw_Z  <- pull_var(a_raw, v_raw, "Z",     syn$Z)
+  Raw_Ph <- pull_var(a_raw, v_raw, "Phase", syn$Phase)
+  
+  if (length(Raw_Z) == 0 && length(Raw_Re) > 0 && length(Raw_Im) > 0) {
+    Raw_Z <- sqrt(Raw_Re^2 + Raw_Im^2)
+  }
+  if (length(Raw_Ph) == 0 && length(Raw_Re) > 0 && length(Raw_Im) > 0) {
+    Raw_Ph <- atan2(Raw_Im, Raw_Re) * 180 / pi
+  }
+  
+  raw_lens <- c(freq = length(freq), Re = length(Raw_Re), Im = length(Raw_Im), Z = length(Raw_Z), Ph = length(Raw_Ph))
+  raw_present <- raw_lens[raw_lens > 0]
+  n_raw <- if (length(raw_present)) min(raw_present) else 0
+  
+  raw_df <- if (n_raw > 0) {
+    tibble(
+      freq   = freq[seq_len(n_raw)],
+      Raw_Re = if (length(Raw_Re)) Raw_Re[seq_len(n_raw)] else NA_real_,
+      Raw_Im = if (length(Raw_Im)) Raw_Im[seq_len(n_raw)] else NA_real_,
+      Raw_Z  = if (length(Raw_Z))  Raw_Z[seq_len(n_raw)]  else NA_real_,
+      Raw_Ph = if (length(Raw_Ph)) Raw_Ph[seq_len(n_raw)] else NA_real_,
+      type   = "Raw"
+    )
+  } else NULL
+  
+  # Pull fit arrays
+  Fit_Re  <- pull_var(a_fit, v_fit, "Z_pred_real",     syn$Fit_Re)
+  Fit_Im  <- pull_var(a_fit, v_fit, "Z_pred_imag",     syn$Fit_Im)
+  Meas_Re <- pull_var(a_fit, v_fit, "Z_measured_real", syn$Meas_Re)
+  Meas_Im <- pull_var(a_fit, v_fit, "Z_measured_imag", syn$Meas_Im)
+  f_freq  <- pull_var(a_fit, v_fit, "freq",            syn$freq)
+  
+  Fit_Z   <- if (length(Fit_Re)  && length(Fit_Im))  sqrt(Fit_Re^2 + Fit_Im^2) else numeric()
+  Fit_Ph  <- if (length(Fit_Re)  && length(Fit_Im))  atan2(Fit_Im, Fit_Re) * 180 / pi else numeric()
+  Meas_Z  <- if (length(Meas_Re) && length(Meas_Im)) sqrt(Meas_Re^2 + Meas_Im^2) else numeric()
+  Meas_Ph <- if (length(Meas_Re) && length(Meas_Im)) atan2(Meas_Im, Meas_Re) * 180 / pi else numeric()
+  
+  fit_lens <- c(freq = length(f_freq), Re = length(Fit_Re), Im = length(Fit_Im))
+  fit_present <- fit_lens[fit_lens > 0]
+  n_fit <- if (length(fit_present)) min(fit_present) else 0
+  
+  fit_df <- if (n_fit > 0) {
+    tibble(
+      freq    = f_freq[seq_len(n_fit)],
+      Fit_Re  = Fit_Re[seq_len(n_fit)],
+      Fit_Im  = Fit_Im[seq_len(n_fit)],
+      Fit_Z   = if (length(Fit_Z))  Fit_Z[seq_len(n_fit)]  else NA_real_,
+      Fit_Ph  = if (length(Fit_Ph)) Fit_Ph[seq_len(n_fit)] else NA_real_,
+      Meas_Re = if (length(Meas_Re) >= n_fit) Meas_Re[seq_len(n_fit)] else NA_real_,
+      Meas_Im = if (length(Meas_Im) >= n_fit) Meas_Im[seq_len(n_fit)] else NA_real_,
+      Meas_Z  = if (length(Meas_Z)  >= n_fit) Meas_Z[seq_len(n_fit)]  else NA_real_,
+      Meas_Ph = if (length(Meas_Ph) >= n_fit) Meas_Ph[seq_len(n_fit)] else NA_real_,
+      type    = "Fit"
+    )
+  } else NULL
+  
+  # Fallback: synthesize Raw from measured arrays if raw was absent
+  if ((is.null(raw_df) || nrow(raw_df) == 0) &&
+      n_fit > 0 &&
+      length(Meas_Re) >= n_fit &&
+      length(Meas_Im) >= n_fit &&
+      length(f_freq)  >= n_fit) {
+    
+    n_use <- min(length(f_freq), length(Meas_Re), length(Meas_Im))
+    Raw_Re_f <- Meas_Re[seq_len(n_use)]
+    Raw_Im_f <- Meas_Im[seq_len(n_use)]
+    Raw_Z_f  <- if (length(Meas_Z)  >= n_use) Meas_Z[seq_len(n_use)]  else sqrt(Raw_Re_f^2 + Raw_Im_f^2)
+    Raw_Ph_f <- if (length(Meas_Ph) >= n_use) Meas_Ph[seq_len(n_use)] else atan2(Raw_Im_f, Raw_Re_f) * 180 / pi
+    
+    raw_df <- tibble(
+      freq   = f_freq[seq_len(n_use)],
+      Raw_Re = Raw_Re_f,
+      Raw_Im = Raw_Im_f,
+      Raw_Z  = Raw_Z_f,
+      Raw_Ph = Raw_Ph_f,
+      type   = "Raw"
+    )
+  }
+  
+  # Sample metadata
+  get_meta <- function(path) {
+    tryCatch({
+      if (is.list(sample_meta)) {
+        if (length(path) == 1) return(scalar1(sample_meta[[path[1]]]))
+        if (length(path) == 2) return(scalar1(sample_meta[[path[1]]][[path[2]]]))
+      }
+      NA
+    }, error = function(e) NA)
+  }
+  
+  comp <- list(
+    cast_type = get_meta(c("print_quality", "cast_type")),
+    date_casted = get_meta(c("print_quality", "date_casted")),
+    area_cm2 = get_meta(c("print_quality", "area_cm2")),
+    fcomp_mat1 = get_meta("fcomp_mat1"),
+    fcomp_mat2 = get_meta("fcomp_mat2"),
+    fcomp_additive = get_meta("fcomp_additive"),
+    fcomp_formulation = get_meta("fcomp_formulation")
+  )
+  
+  add_meta <- function(df) {
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    nrows <- nrow(df)
+    
+    # Attach scalar metadata
+    df$sample_id   <- sample_id
+    df$pin         <- pin_entry$pin %||% NA_integer_
+    df$file_name   <- pin_entry$file_name %||% pin_key
+    df$cycle_index <- cycle_obj$cycle %||% NA_integer_
+    
+    # Attach component metadata, repeating to match nrows
+    for (nm in names(comp)) {
+      df[[nm]] <- rep_len(comp[[nm]], nrows)
+    }
+    
+    df
+  }
+  
+  dplyr::bind_rows(add_meta(raw_df), add_meta(fit_df))
 }
 
 tidy_eis_data <- function(json_data) {
-  samples <- json_data$samples
-  if (is.null(samples) || length(samples) == 0) stop("No samples found in the provided JSON.")
-  imap_dfr(samples, function(sample_meta, sample_id) {
-    eis <- sample_meta$eis_results
-    if (is.null(eis) || length(eis) == 0) return(NULL)
-    imap_dfr(eis, function(pin_entry, pin_key) {
-      cycles <- pin_entry$cycle_data
-      if (is.null(cycles) || length(cycles) == 0) return(NULL)
-      map_dfr(cycles, function(cycle_obj) {
-        extract_cycle_df(sample_id, sample_meta, pin_key, pin_entry, cycle_obj)
+  samples <- json_data$samples %||% list()
+  if (is.data.frame(samples)) {
+    if (nrow(samples) == 0) return(tibble::tibble())
+    samples <- split(samples, seq_len(nrow(samples)))
+  }
+  if (!is.list(samples) || length(samples) == 0) return(tibble::tibble())
+  if (is.null(names(samples))) names(samples) <- paste0("sample_", seq_along(samples))
+  
+  rows <- purrr::imap(samples, function(smp, sid) {
+    # Use normalized pins if present, or try to build from the sample itself
+    eis <- smp$eis_results %||% build_pin_map(smp)$map %||% list()
+    if (!length(eis)) return(tibble::tibble())
+    
+    purrr::imap_dfr(eis, function(pe, pk) {
+      cycles <- pe$cycle_data %||% list()
+      if (!length(cycles)) return(tibble::tibble())
+      
+      purrr::imap_dfr(cycles, function(cyc, ci) {
+        extract_cycle_rows(
+          sample_id   = sid,
+          sample_meta = smp,
+          pin_key     = pk,
+          pin_entry   = pe,
+          cycle_obj   = cyc
+        )
       })
     })
   })
+  
+  dplyr::bind_rows(rows) %>%
+    # Stabilize column types for downstream joins
+    dplyr::mutate(
+      sample_id   = as.character(sample_id),
+      pin         = as.integer(pin),
+      file_name   = as.character(file_name),
+      cycle_index = as.integer(cycle_index),
+      type        = as.character(type)
+    )
 }
 
-# -----------------------------
-# Metrics and summary builders
-# -----------------------------
+# =============================================================================
+# PLOTTING
+# =============================================================================
+label_for <- function(dsub) paste0("C", dsub$cycle_index[1], " | P", dsub$pin[1])
+
+hover_for <- function(dsub, type = "raw") {
+  base <- paste0("Sample: ", dsub$sample_id, "<br>Pin: ", dsub$pin,
+                 "<br>File: ", dsub$file_name, "<br>Cycle: ", dsub$cycle_index,
+                 "<br>freq: ", signif(dsub$freq, 6))
+  if (type == "raw") {
+    paste0(base, "<br>Re: ", signif(dsub$Raw_Re, 6), "<br>Im: ", signif(dsub$Raw_Im, 6))
+  } else {
+    paste0(base, "<br>Re_fit: ", signif(dsub$Fit_Re, 6), "<br>Im_fit: ", signif(dsub$Fit_Im, 6))
+  }
+}
+
+get_palette <- function(palette_mode, n) {
+  pal_func <- switch(palette_mode,
+                     "Viridis" = viridis, "Plasma" = plasma,
+                     "Magma"   = magma,   "Cividis" = cividis, viridis)
+  pal_func(n)
+}
+
+build_nyquist_plot <- function(df, palette_mode) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  
+  combos <- df %>% distinct(pin, cycle_index) %>% arrange(pin, cycle_index)
+  colors <- get_palette(palette_mode, nrow(combos))
+  p <- plot_ly()
+  
+  purrr::iwalk(seq_len(nrow(combos)), function(i, idx) {
+    combo <- combos[i, ]
+    dsub_raw <- df %>% filter(type == "Raw", pin == combo$pin, cycle_index == combo$cycle_index)
+    dsub_fit <- df %>% filter(type == "Fit", pin == combo$pin, cycle_index == combo$cycle_index)
+    lbl <- label_for(dsub_raw %||% dsub_fit)
+    
+    if (nrow(dsub_raw) > 0) {
+      p <<- p %>% add_trace(
+        x = dsub_raw$Raw_Re, y = dsub_raw$Raw_Im, name = lbl,
+        type = 'scatter', mode = 'markers', alpha = 0.5,
+        marker = list(color = colors[i], size = 6),
+        text = hover_for(dsub_raw, "raw"), hoverinfo = "text",
+        legendgroup = lbl, showlegend = TRUE
+      )
+    }
+    if (nrow(dsub_fit) > 0) {
+      p <<- p %>% add_trace(
+        x = dsub_fit$Fit_Re, y = -dsub_fit$Fit_Im, name = lbl,
+        type = 'scatter', mode = 'lines',
+        line = list(color = colors[i], width = 2, dash = "dash"),
+        text = hover_for(dsub_fit, "fit"), hoverinfo = "text",
+        legendgroup = lbl, showlegend = nrow(dsub_raw) == 0
+      )
+    }
+  })
+  
+  p %>% layout(title = "Nyquist Plot", xaxis = list(title = "Z' (Ω)"),
+               yaxis = list(title = "-Z'' (Ω)"))
+}
+
+build_bode_mag_plot <- function(df, palette_mode) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  
+  combos <- df %>% distinct(pin, cycle_index) %>% arrange(pin, cycle_index)
+  colors <- get_palette(palette_mode, nrow(combos))
+  p <- plot_ly()
+  
+  purrr::iwalk(seq_len(nrow(combos)), function(i, idx) {
+    combo <- combos[i, ]
+    dsub_raw <- df %>% filter(type == "Raw", pin == combo$pin, cycle_index == combo$cycle_index)
+    dsub_fit <- df %>% filter(type == "Fit", pin == combo$pin, cycle_index == combo$cycle_index)
+    lbl <- label_for(dsub_raw %||% dsub_fit)
+    
+    if (nrow(dsub_raw) > 0) {
+      p <<- p %>% add_trace(
+        x = dsub_raw$freq, y = sqrt(dsub_raw$Raw_Re^2 + dsub_raw$Raw_Im^2),
+        name = lbl, type = 'scatter', mode = 'markers', alpha = 0.5,
+        marker = list(color = colors[i], size = 6),
+        text = hover_for(dsub_raw, "raw"), hoverinfo = "text",
+        legendgroup = lbl, showlegend = TRUE
+      )
+    }
+    if (nrow(dsub_fit) > 0) {
+      p <<- p %>% add_trace(
+        x = dsub_fit$freq, y = sqrt(dsub_fit$Fit_Re^2 + dsub_fit$Fit_Im^2),
+        name = lbl, type = 'scatter', mode = 'lines',
+        line = list(color = colors[i], width = 2, dash = "dash"),
+        text = hover_for(dsub_fit, "fit"), hoverinfo = "text",
+        legendgroup = lbl, showlegend = nrow(dsub_raw) == 0
+      )
+    }
+  })
+  
+  p %>% layout(title = "Bode Magnitude",
+               xaxis = list(title = "Frequency (Hz)", type = "log", exponentformat = "e"),
+               yaxis = list(title = "|Z| (Ω)"))
+}
+
+build_bode_phase_plot <- function(df, palette_mode) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  
+  combos <- df %>% distinct(pin, cycle_index) %>% arrange(pin, cycle_index)
+  colors <- get_palette(palette_mode, nrow(combos))
+  p <- plot_ly()
+  
+  purrr::iwalk(seq_len(nrow(combos)), function(i, idx) {
+    combo <- combos[i, ]
+    dsub_raw <- df %>% filter(type == "Raw", pin == combo$pin, cycle_index == combo$cycle_index)
+    dsub_fit <- df %>% filter(type == "Fit", pin == combo$pin, cycle_index == combo$cycle_index)
+    lbl <- label_for(dsub_raw %||% dsub_fit)
+    
+    if (nrow(dsub_raw) > 0) {
+      p <<- p %>% add_trace(
+        x = dsub_raw$freq, y = atan2(dsub_raw$Raw_Im, dsub_raw$Raw_Re) * 180 / pi,
+        name = lbl, type = 'scatter', mode = 'markers', alpha = 0.5,
+        marker = list(color = colors[i], size = 6),
+        text = hover_for(dsub_raw, "raw"), hoverinfo = "text",
+        legendgroup = lbl, showlegend = TRUE
+      )
+    }
+    if (nrow(dsub_fit) > 0) {
+      p <<- p %>% add_trace(
+        x = dsub_fit$freq, y = -atan2(dsub_fit$Fit_Im, dsub_fit$Fit_Re) * 180 / pi,
+        name = lbl, type = 'scatter', mode = 'lines',
+        line = list(color = colors[i], width = 2, dash = "dash"),
+        text = hover_for(dsub_fit, "fit"), hoverinfo = "text",
+        legendgroup = lbl, showlegend = nrow(dsub_raw) == 0
+      )
+    }
+  })
+  
+  p %>% layout(title = "Bode Phase",
+               xaxis = list(title = "Frequency (Hz)", type = "log", exponentformat = "e"),
+               yaxis = list(title = "Phase (deg)"))
+}
+
+build_linkk_plot <- function(df, palette_mode) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  
+  fit <- df %>% filter(type == "Fit")
+  if (nrow(fit) == 0) return(NULL)
+  
+  has_measured <- !all(is.na(fit$Meas_Re)) && !all(is.na(fit$Meas_Im))
+  if (!has_measured) return(NULL)
+  
+  combos <- fit %>% distinct(pin, cycle_index) %>% arrange(pin, cycle_index)
+  colors <- get_palette(palette_mode, nrow(combos))
+  p <- plot_ly()
+  
+  purrr::iwalk(seq_len(nrow(combos)), function(i, idx) {
+    combo <- combos[i, ]
+    dsub <- fit %>% filter(pin == combo$pin, cycle_index == combo$cycle_index)
+    if (nrow(dsub) == 0) return()
+    
+    lbl <- label_for(dsub)
+    re_res <- (dsub$Raw_Re - dsub$Fit_Re)
+    im_res  <- dsub$Raw_Im - dsub$Fit_Im
+    
+    p <<- p %>% add_trace(
+      x = dsub$freq, y = re_res, name = lbl,
+      type = 'scatter', mode = 'lines',
+      marker = list(color = colors[i], size = 6),
+      text = paste0("freq: ", signif(dsub$freq, 6), "<br>real residual: ", signif(re_res, 6)),
+      hoverinfo = "text", legendgroup = lbl, showlegend = TRUE
+    ) %>% add_trace(
+      x = dsub$freq, y = im_res, name = lbl,
+      type = 'scatter', mode = 'lines',
+      line = list(color = colors[i], width = 2, dash = "dash"),
+      text = paste0("freq: ", signif(dsub$freq, 6), "<br>imaginary residual: ", signif(im_res, 6)),
+      hoverinfo = "text", legendgroup = lbl, showlegend = TRUE
+    )
+  })
+  
+  p %>% layout(title = "Lin-KK Residuals",
+               xaxis = list(title = "Frequency (Hz)", type = "log", exponentformat = "e"),
+               yaxis = list(title = "Residuals"))
+}
+
+# =============================================================================
+# FIT METRICS
+# =============================================================================
 extract_fit_metrics <- function(cycles) {
   if (length(cycles) == 0) return(NULL)
-  all_keys <- unique(unlist(lapply(cycles, names)))
-  exclude_keys <- c("data_array_values","data_array_variables","fit_array_values","fit_array_variables","fit_value_arrays","all_values","all_variables")
+  
+  all_keys <- unique(unlist(purrr::map(cycles, names)))
+  exclude_keys <- c("data_array_values", "data_array_variables",
+                    "fit_array_values", "fit_array_variables",
+                    "fit_value_arrays", "all_values", "all_variables", "fitting")
   metric_keys <- setdiff(all_keys, exclude_keys)
   main_metrics <- metric_keys[!endsWith(metric_keys, "_stDev")]
   
-  metrics <- lapply(main_metrics, function(mk) {
-    vals <- lapply(cycles, function(cyc) {
-      v <- cyc[[mk]]
-      if (is.list(v)) v <- unlist(v)
-      if (length(v) > 0) v[1] else NA
-    })
+  purrr::map(main_metrics, function(mk) {
+    vals     <- purrr::map(cycles, ~scalar1(.x[[mk]]))
     vals_num <- suppressWarnings(as.numeric(vals))
-    if (all(is.na(vals_num))) vals_num <- vals
-    stdevs <- lapply(cycles, function(cyc) {
-      v <- cyc[[paste0(mk, "_stDev")]]
-      if (is.list(v)) v <- unlist(v)
-      if (length(v) > 0) v[1] else NA
-    })
+    
+    stdevs     <- purrr::map(cycles, ~scalar1(.x[[paste0(mk, "_stDev")]]))
     stdevs_num <- suppressWarnings(as.numeric(stdevs))
-    if (all(is.na(stdevs_num))) stdevs_num <- stdevs
-    val <- if (length(vals_num) > 1 && is.numeric(vals_num)) mean(vals_num, na.rm = TRUE) else vals_num[[1]]
-    stdev <- if (length(stdevs_num) > 1 && is.numeric(stdevs_num)) mean(stdevs_num, na.rm = TRUE) else stdevs_num[[1]]
-    list(name = mk, value = val, stdev = stdev)
-  })
-  Filter(function(x) !is.na(x$value) && x$value != "NA", metrics)
+    
+    list(
+      name  = mk,
+      value = if (length(vals_num) > 1 && is.numeric(vals_num)) mean(vals_num, na.rm = TRUE) else vals_num[[1]],
+      stdev = if (length(stdevs_num) > 1 && is.numeric(stdevs_num)) mean(stdevs_num, na.rm = TRUE) else stdevs_num[[1]]
+    )
+  }) %>% purrr::keep(~!is.na(.x$value) && .x$value != "NA")
 }
 
-build_fit_metrics_table <- function(metrics) {
-  if (is.null(metrics) || length(metrics) == 0) {
-    return(data.frame(Message = "No fit metrics found for this selection."))
+build_fit_metrics_table <- function(metrics_list) {
+  if (is.null(metrics_list) || length(metrics_list) == 0) {
+    return(gt::gt(data.frame(Message = "No fit metrics found")))
   }
-  data.frame(
-    Metric = sapply(metrics, function(m) m$name),
-    Value = sapply(metrics, function(m) {
-      if (!is.na(m$stdev) && !is.na(m$value) && is.numeric(m$value) && is.numeric(m$stdev)) {
+  
+  all_metric_names <- unique(unlist(purrr::map(metrics_list, ~purrr::map_chr(.x$metrics, "name"))))
+  df <- tibble::tibble(Metric = all_metric_names)
+  
+  for (item in metrics_list) {
+    values <- purrr::map_chr(all_metric_names, function(mn) {
+      m <- purrr::detect(item$metrics, ~.x$name == mn)
+      if (is.null(m)) return(NA_character_)
+      if (!is.na(m$stdev) && is.numeric(m$value) && is.numeric(m$stdev)) {
         sprintf("%.4g ± %.4g", m$value, m$stdev)
       } else if (!is.na(m$value) && is.numeric(m$value)) {
         sprintf("%.4g", m$value)
-      } else if (!is.na(m$value)) {
-        as.character(m$value)
       } else {
-        "NA"
+        as.character(m$value)
       }
-    }),
-    stringsAsFactors = FALSE
-  )
-}
-
-build_file_summary_table <- function(df) {
-  if (is.null(df) || nrow(df) == 0) return(data.frame(Message = "No selection or no data."))
-  df %>%
-    group_by(sample_id, pin, file_name, cycle_index, cast_type, fcomp_formulation, fcomp_additive, fcomp_salt) %>%
-    summarise(
-      n_raw = sum(type == "Raw"),
-      n_fit = sum(type == "Fit"),
-      freq_min = suppressWarnings(min(freq, na.rm = TRUE)),
-      freq_max = suppressWarnings(max(freq, na.rm = TRUE)),
-      .groups = "drop"
-    ) %>%
-    arrange(sample_id, pin, file_name, cycle_index)
-}
-
-# -----------------------------
-# Plot builders
-# -----------------------------
-label_for <- function(dsub, kind) {
-  paste0(
-    kind, " | Sample: ", dsub$sample_id[1],
-    " | Pin: ", dsub$pin[1],
-    " | File: ", dsub$file_name[1],
-    " | Cycle: ", dsub$cycle_index[1],
-    " | Cast: ", dsub$cast_type[1],
-    " | Formulation: ", dsub$fcomp_formulation[1]
-  )
-}
-
-hover_for_raw <- function(dsub) {
-  paste0(
-    "Sample: ", dsub$sample_id,
-    "<br>Pin: ", dsub$pin,
-    "<br>File: ", dsub$file_name,
-    "<br>Cycle: ", dsub$cycle_index,
-    "<br>freq: ", signif(dsub$freq, 6),
-    "<br>Re: ", signif(dsub$Raw_Re, 6),
-    "<br>Im: ", signif(dsub$Raw_Im, 6)
-  )
-}
-
-hover_for_fit <- function(dsub) {
-  paste0(
-    "Sample: ", dsub$sample_id,
-    "<br>Pin: ", dsub$pin,
-    "<br>File: ", dsub$file_name,
-    "<br>Cycle: ", dsub$cycle_index,
-    "<br>freq: ", signif(dsub$freq, 6),
-    "<br>Re_fit: ", signif(dsub$Fit_Re, 6),
-    "<br>Im_fit: ", signif(dsub$Fit_Im, 6)
-  )
-}
-
-build_nyquist_plot <- function(df, plot_width, plot_height, overlay_pins, overlay_cycles) {
-  if (is.null(df) || nrow(df) == 0) return(NULL)
-  p <- plot_ly(width = plot_width, height = plot_height)
-  
-  grouping_vals <- if (isTRUE(overlay_pins)) unique(df$pin) else unique(df$file_name)
-  cycles <- if (isTRUE(overlay_cycles)) unique(df$cycle_index) else unique(df$cycle_index)[1]
-  
-  for (grp in grouping_vals) {
-    for (cyc in cycles) {
-      dsub_raw <- df %>% filter(type == "Raw",
-                                if (isTRUE(overlay_pins)) pin == grp else file_name == grp,
-                                cycle_index == cyc)
-      dsub_fit <- df %>% filter(type == "Fit",
-                                if (isTRUE(overlay_pins)) pin == grp else file_name == grp,
-                                cycle_index == cyc)
-      if (nrow(dsub_raw) > 0) {
-        p <- p %>% add_trace(
-          x = dsub_raw$Raw_Re, y = dsub_raw$Raw_Im,
-          name = label_for(dsub_raw, "Raw"),
-          type = 'scatter', mode = 'markers',
-          marker = marker_style, text = hover_for_raw(dsub_raw), hoverinfo = "text"
-        )
-      }
-      if (nrow(dsub_fit) > 0) {
-        p <- p %>% add_trace(
-          x = dsub_fit$Fit_Re, y = dsub_fit$Fit_Im,
-          name = label_for(dsub_fit, "Fit"),
-          type = 'scatter', mode = 'lines',
-          line = line_style, text = hover_for_fit(dsub_fit), hoverinfo = "text"
-        )
-      }
-    }
+    })
+    df[[item$label]] <- values
   }
   
-  p %>% layout(title = "Nyquist Plot", xaxis = list(title = "Z' (Real)"), yaxis = list(title = "Z'' (Imaginary)"))
+  df %>% gt() %>%
+    tab_style(style = cell_text(size = px(10)), locations = cells_body()) %>%
+    tab_style(style = cell_text(size = px(11), weight = "bold"), locations = cells_column_labels()) %>%
+    tab_options(table.font.size = px(10))
 }
 
-build_bode_mag_plot <- function(df, plot_width, plot_height, overlay_pins, overlay_cycles) {
-  if (is.null(df) || nrow(df) == 0) return(NULL)
-  p <- plot_ly(width = plot_width, height = plot_height)
+# =============================================================================
+# UI
+# =============================================================================
+build_ui <- function(plot_df, json_data) {
+  sample_names <- sort(unique(names(json_data$samples %||% list())))
+  if (length(sample_names) == 0) sample_names <- "No samples"
   
-  grouping_vals <- if (isTRUE(overlay_pins)) unique(df$pin) else unique(df$file_name)
-  cycles <- if (isTRUE(overlay_cycles)) unique(df$cycle_index) else unique(df$cycle_index)[1]
-  
-  for (grp in grouping_vals) {
-    for (cyc in cycles) {
-      dsub_raw <- df %>% filter(type == "Raw",
-                                if (isTRUE(overlay_pins)) pin == grp else file_name == grp,
-                                cycle_index == cyc)
-      dsub_fit <- df %>% filter(type == "Fit",
-                                if (isTRUE(overlay_pins)) pin == grp else file_name == grp,
-                                cycle_index == cyc)
-      if (nrow(dsub_raw) > 0) {
-        p <- p %>% add_trace(
-          x = dsub_raw$freq, y = sqrt(dsub_raw$Raw_Re^2 + dsub_raw$Raw_Im^2),
-          name = paste("Raw |Z|", dsub_raw$file_name[1], "Cycle", cyc),
-          type = 'scatter', mode = 'markers',
-          marker = marker_style, text = hover_for_raw(dsub_raw), hoverinfo = "text"
-        )
-      }
-      if (nrow(dsub_fit) > 0) {
-        p <- p %>% add_trace(
-          x = dsub_fit$freq, y = sqrt(dsub_fit$Fit_Re^2 + dsub_fit$Fit_Im^2),
-          name = paste("Fit |Z|", dsub_fit$file_name[1], "Cycle", cyc),
-          type = 'scatter', mode = 'lines',
-          line = line_style, text = hover_for_fit(dsub_fit), hoverinfo = "text"
-        )
-      }
-    }
-  }
-  
-  p %>% layout(title = "Bode Magnitude Plot", xaxis = list(title = "Frequency (Hz)", type = "log"), yaxis = list(title = "|Z| (Ohm)", side = "left"))
-}
-
-build_bode_phase_plot <- function(df, plot_width, plot_height, overlay_pins, overlay_cycles) {
-  if (is.null(df) || nrow(df) == 0) return(NULL)
-  p <- plot_ly(width = plot_width, height = plot_height)
-  
-  grouping_vals <- if (isTRUE(overlay_pins)) unique(df$pin) else unique(df$file_name)
-  cycles <- if (isTRUE(overlay_cycles)) unique(df$cycle_index) else unique(df$cycle_index)[1]
-  
-  for (grp in grouping_vals) {
-    for (cyc in cycles) {
-      dsub_raw <- df %>% filter(type == "Raw",
-                                if (isTRUE(overlay_pins)) pin == grp else file_name == grp,
-                                cycle_index == cyc)
-      dsub_fit <- df %>% filter(type == "Fit",
-                                if (isTRUE(overlay_pins)) pin == grp else file_name == grp,
-                                cycle_index == cyc)
-      if (nrow(dsub_raw) > 0) {
-        p <- p %>% add_trace(
-          x = dsub_raw$freq, y = atan2(dsub_raw$Raw_Im, dsub_raw$Raw_Re) * 180 / pi,
-          name = paste("Raw Phase", dsub_raw$file_name[1], "Cycle", cyc),
-          type = 'scatter', mode = 'markers',
-          marker = marker_style, text = hover_for_raw(dsub_raw), hoverinfo = "text"
-        )
-      }
-      if (nrow(dsub_fit) > 0) {
-        p <- p %>% add_trace(
-          x = dsub_fit$freq, y = atan2(dsub_fit$Fit_Im, dsub_fit$Fit_Re) * 180 / pi,
-          name = paste("Fit Phase", dsub_fit$file_name[1], "Cycle", cyc),
-          type = 'scatter', mode = 'lines',
-          line = line_style, text = hover_for_fit(dsub_fit), hoverinfo = "text"
-        )
-      }
-    }
-  }
-  
-  p %>% layout(title = "Bode Phase Plot", xaxis = list(title = "Frequency (Hz)", type = "log"), yaxis = list(title = "Phase (deg)", side = "left"))
-}
-
-build_linkk_plot <- function(df, plot_width, plot_height, overlay_pins, overlay_cycles) {
-  if (is.null(df) || nrow(df) == 0) return(NULL)
-  fit <- df %>% filter(type == "Fit")
-  if (nrow(fit) == 0) return(NULL)
-  has_measured <- !all(is.na(fit$Meas_Re)) && !all(is.na(fit$Meas_Im))
-  
-  p <- plot_ly(width = plot_width, height = plot_height)
-  grouping_vals <- if (isTRUE(overlay_pins)) unique(fit$pin) else unique(fit$file_name)
-  cycles <- if (isTRUE(overlay_cycles)) unique(fit$cycle_index) else unique(fit$cycle_index)[1]
-  
-  for (grp in grouping_vals) {
-    for (cyc in cycles) {
-      dsub_fit <- fit %>% filter(if (isTRUE(overlay_pins)) pin == grp else file_name == grp, cycle_index == cyc)
-      if (nrow(dsub_fit) == 0) next
-      
-      mag_meas <- if (has_measured) dsub_fit$Meas_Z else NA_real_
-      ph_meas  <- if (has_measured) dsub_fit$Meas_Ph else NA_real_
-      mag_fit  <- dsub_fit$Fit_Z
-      ph_fit   <- dsub_fit$Fit_Ph
-      mag_res  <- if (has_measured) (mag_meas - mag_fit) / pmax(mag_meas, 1e-12) else NA_real_
-      ph_res   <- if (has_measured) (ph_meas - ph_fit) else NA_real_
-      
-      if (has_measured) {
-        p <- p %>% add_trace(
-          x = dsub_fit$freq, y = mag_res,
-          name = paste("Lin-KK Mag Residual", dsub_fit$file_name[1], "Cycle", cyc),
-          type = 'scatter', mode = 'markers',
-          marker = marker_style,
-          text = paste0("freq: ", signif(dsub_fit$freq, 6), "<br>mag residual: ", signif(mag_res, 6)),
-          hoverinfo = "text"
-        )
-        p <- p %>% add_trace(
-          x = dsub_fit$freq, y = ph_res,
-          name = paste("Lin-KK Phase Residual", dsub_fit$file_name[1], "Cycle", cyc),
-          type = 'scatter', mode = 'lines',
-          line = line_style,
-          text = paste0("freq: ", signif(dsub_fit$freq, 6), "<br>phase residual: ", signif(ph_res, 6)),
-          hoverinfo = "text"
-        )
-      }
-    }
-  }
-  
-  p %>% layout(title = "Lin-KK Residuals", xaxis = list(title = "Frequency (Hz)", type = "log"),
-               yaxis = list(title = "Residuals", side = "left"))
-}
-
-build_panel_plot <- function(df, plot_width, plot_height, overlay_pins, overlay_cycles, panel_selection) {
-  panels <- list()
-  if ("nyq" %in% panel_selection) panels <- append(panels, list(build_nyquist_plot(df, plot_width, plot_height, overlay_pins, overlay_cycles)))
-  if ("mag" %in% panel_selection) panels <- append(panels, list(build_bode_mag_plot(df, plot_width, plot_height, overlay_pins, overlay_cycles)))
-  if ("ph"  %in% panel_selection) panels <- append(panels, list(build_bode_phase_plot(df, plot_width, plot_height, overlay_pins, overlay_cycles)))
-  if ("kk"  %in% panel_selection) panels <- append(panels, list(build_linkk_plot(df, plot_width, plot_height, overlay_pins, overlay_cycles)))
-  if (length(panels) == 0) return(plot_ly())
-  
-  empty_plot <- plot_ly() %>% layout(xaxis = list(visible = FALSE), yaxis = list(visible = FALSE))
-  while (length(panels) < 4) panels <- append(panels, list(empty_plot))
-  subplot(panels[[1]], panels[[2]], panels[[3]], panels[[4]], nrows = 2, margin = 0.07, shareX = FALSE, shareY = FALSE, titleX = TRUE, titleY = TRUE)
-}
-
-# -----------------------------
-# Filtering utilities
-# -----------------------------
-apply_filters <- function(df, sample_id, pins, files, cycles, cast_type, fcomp_additive, fcomp_salt, fcomp_formulation) {
-  req(sample_id)
-  out <- df %>% filter(sample_id == sample_id)
-  if (!is.null(pins) && length(pins) > 0)           out <- out %>% filter(pin %in% pins)
-  if (!is.null(files) && length(files) > 0)         out <- out %>% filter(file_name %in% files)
-  if (!is.null(cycles) && length(cycles) > 0)       out <- out %>% filter(cycle_index %in% cycles)
-  if (!is.null(cast_type) && cast_type != "Any")    out <- out %>% filter(cast_type == cast_type)
-  if (!is.null(fcomp_additive) && fcomp_additive != "Any") out <- out %>% filter(fcomp_additive == fcomp_additive)
-  if (!is.null(fcomp_salt) && fcomp_salt != "Any")  out <- out %>% filter(fcomp_salt == fcomp_salt)
-  if (!is.null(fcomp_formulation) && fcomp_formulation != "Any") out <- out %>% filter(fcomp_formulation == fcomp_formulation)
-  out
-}
-
-# -----------------------------
-# UI wrapper
-# -----------------------------
-build_ui <- function(plot_df) {
   fluidPage(
-    titlePanel("EIS Viewer, modular functions with metadata filters"),
-    sidebarLayout(
-      sidebarPanel(
-        selectInput("sample_id", "Sample", choices = unique(plot_df$sample_id)),
-        uiOutput("pin_ui"),
-        uiOutput("file_ui"),
-        uiOutput("cycle_ui"),
-        
-        h4("Composition filters"),
-        uiOutput("cast_type_ui"),
-        uiOutput("fcomp_additive_ui"),
-        uiOutput("fcomp_salt_ui"),
-        uiOutput("fcomp_formulation_ui"),
-        
-        checkboxInput("overlay_cycles", "Overlay selected cycles", value = FALSE),
-        checkboxInput("overlay_pins", "Overlay selected pins", value = FALSE),
-        
-        hr(),
-        h4("Plot Controls"),
-        sliderInput("plot_width", "Panel Width (px)", min = 600, max = 1400, value = 1000),
-        radioButtons("view_mode", "View mode", choices = c("Individual plots", "2x2 multi-plot"), selected = "2x2 multi-plot"),
-        checkboxGroupInput("panel_selection", "Plots to include in 2x2 panel",
-                           choices = c("Nyquist" = "nyq", "Bode Magnitude" = "mag", "Bode Phase" = "ph", "Lin-KK Residuals" = "kk"),
-                           selected = c("nyq", "mag", "ph", "kk")),
-        
-        hr(),
-        h4("File and metadata summary"),
-        DT::dataTableOutput("file_summary"),
-        
-        hr(),
-        h4("Fit Metrics"),
-        DT::dataTableOutput("fit_metrics")
-      ),
-      mainPanel(
-        uiOutput("plots_container"),
-        uiOutput("nodata_msg")
-      )
+    shinyjs::useShinyjs(),
+    tags$head(tags$style(HTML("
+      .plot-col { height: 45vh; }
+      .plot-col .html-widget { height: 100% !important; }
+      .combo-panel .form-group { margin-bottom: 4px; }
+      .combo-panel .shiny-input-container { margin-bottom: 4px !important; }
+      .combo-panel .control-label { margin-bottom: 2px; font-weight: 500; font-size: 11px; }
+      .combo-panel input[type='text'] { height: 26px; padding: 2px 6px; font-size: 11px; }
+      .combo-panel .checkbox { margin-top: 0; margin-bottom: 2px; font-size: 11px; }
+      .combo-row {
+        display: grid; grid-template-columns: 100px 50px 1fr; gap: 8px;
+        align-items: center; margin-bottom: 6px; padding: 4px; border-bottom: 1px solid #eee;
+      }
+    "))),
+    tags$h3("EIS Viewer"),
+    
+    fluidRow(
+      column(3, wellPanel(
+        selectInput(
+          "sample_id", "Sample",
+          choices = sample_names,
+          selected = (intersect(sample_names, sort(unique(plot_df$sample_id)))[1] %||% sample_names[1])
+        ),
+        selectInput("palette_mode", "Color palette",
+                    choices = c("Viridis", "Plasma", "Magma", "Cividis"), selected = "Viridis"),
+        actionButton("save_progress", "Save Progress", class = "btn-primary", style = "width: 100%;"),
+        actionButton("reload_from_env", "Reload from env", style = "width: 100%; margin-top: 6px;")
+      )),
+      column(5, wellPanel(class = "combo-panel",
+                          tags$div(style = "font-weight:600; display:flex; gap:16px; margin-bottom:8px;",
+                                   tags$span("Plot"), tags$span("Flag"), tags$span("Notes")),
+                          tags$div(style = "max-height: 40vh; overflow-y: auto;", uiOutput("combo_matrix_ui"))
+      )),
+      column(4, wellPanel(h4("Fit Metrics"), gt_output("metrics_gt")))
+    ),
+    
+    fluidRow(
+      column(6, div(class = "plot-col", plotlyOutput("nyquist", height = "100%"))),
+      column(6, div(class = "plot-col", plotlyOutput("linkk", height = "100%")))
+    ),
+    fluidRow(
+      column(6, div(class = "plot-col", plotlyOutput("bode_mag", height = "100%"))),
+      column(6, div(class = "plot-col", plotlyOutput("bode_phase", height = "100%")))
     )
   )
 }
 
-# -----------------------------
-# Server wrapper
-# -----------------------------
+# =============================================================================
+# SERVER
+# =============================================================================
 build_server <- function(plot_df, json_data) {
+  if (is.null(plot_df) || !"sample_id" %in% colnames(plot_df)) {
+    stop("plot_df is invalid or missing the 'sample_id' column")
+  }
+  
   function(input, output, session) {
-    plot_height <- reactive({ input$plot_width * 0.5 })
+    rv_combined <- reactiveVal(json_data)
+    rv_fitdf    <- reactiveVal(plot_df)
+    rv_flags    <- reactiveVal(list())
+    rv_notes    <- reactiveVal(list())
     
-    output$nodata_msg <- renderUI({
-      if (is.null(plot_df) || nrow(plot_df) == 0) {
-        tags$div(style="color:red;", "No valid EIS data found in the provided JSON.")
+    # Defensive combos listing
+    combos_df <- reactive({
+      req(input$sample_id)
+      if (identical(input$sample_id, "No samples")) {
+        return(tibble(pin = integer(), file_name = character(), cycle_index = integer(),
+                      id = character(), label = character())[0, ])
+      }
+      df <- rv_fitdf() %>% dplyr::filter(sample_id == input$sample_id)
+      
+      needed <- c("pin","file_name","cycle_index")
+      if (!all(needed %in% names(df))) {
+        return(tibble(pin = integer(), file_name = character(), cycle_index = integer(),
+                      id = character(), label = character())[0, ])
+      }
+      
+      df %>%
+        dplyr::distinct(pin, file_name, cycle_index) %>%
+        dplyr::arrange(pin, cycle_index, file_name) %>%
+        dplyr::mutate(
+          id    = paste(pin, file_name, cycle_index, sep = "||"),
+          label = paste0("C", cycle_index, " | P", pin)
+        )
+    })
+    
+    # Load flags/notes from JSON when sample changes
+    observe({
+      req(input$sample_id)
+      smp <- rv_combined()$samples[[input$sample_id]]
+      
+      # Short circuit if no EIS
+      if (is.null(smp$eis_results) || !length(smp$eis_results)) {
+        rv_flags(list())
+        rv_notes(list())
+        return()
+      }
+      
+      typed_empty <- tibble(id = character(), flag = logical(), note = character())
+      
+      flags_notes <- purrr::imap_dfr(smp$eis_results, function(pe, pk) {
+        cycles <- pe$cycle_data %||% list()
+        if (!length(cycles)) return(typed_empty)
+        purrr::imap_dfr(cycles, function(cyc, ci) {
+          if (!is.list(cyc)) return(typed_empty)
+          tibble(
+            id   = paste(pe$pin %||% NA_integer_, pe$file_name %||% "", cyc$cycle %||% NA_integer_, sep = "||"),
+            flag = isTRUE(cyc$eis_flag),
+            note = cyc$eis_note %||% ""
+          )
+        })
+      })
+      
+      if (nrow(flags_notes) == 0) {
+        rv_flags(list())
+        rv_notes(list())
+      } else {
+        rv_flags(setNames(as.list(flags_notes$flag), flags_notes$id))
+        rv_notes(setNames(as.list(flags_notes$note), flags_notes$id))
       }
     })
     
-    # Dynamic filter UIs
-    output$pin_ui <- renderUI({
-      req(input$sample_id)
-      pins <- plot_df %>% filter(sample_id == input$sample_id) %>% pull(pin) %>% unique()
-      selectInput("pin", "Pin", choices = sort(na.omit(pins)), multiple = TRUE)
-    })
-    output$file_ui <- renderUI({
-      req(input$sample_id)
-      selected_pins <- input$pin %||% unique(plot_df$pin[plot_df$sample_id == input$sample_id])
-      files <- plot_df %>% filter(sample_id == input$sample_id, pin %in% selected_pins) %>% pull(file_name) %>% unique()
-      selectInput("file_name", "File", choices = sort(files), multiple = TRUE)
-    })
-    output$cycle_ui <- renderUI({
-      req(input$sample_id)
-      selected_pins <- input$pin %||% unique(plot_df$pin[plot_df$sample_id == input$sample_id])
-      selected_files <- input$file_name %||% unique(plot_df$file_name[plot_df$sample_id == input$sample_id])
-      cycles <- plot_df %>%
-        filter(sample_id == input$sample_id, pin %in% selected_pins, file_name %in% selected_files) %>%
-        pull(cycle_index) %>% unique()
-      selectInput("cycle_index", "Cycle", choices = sort(na.omit(cycles)), multiple = TRUE, selected = sort(na.omit(cycles))[1])
+    
+    output$combo_matrix_ui <- renderUI({
+      df    <- combos_df()
+      flags <- rv_flags()
+      notes <- rv_notes()
+      
+      rows <- purrr::imap(df$id, function(combo_id, i) {
+        tags$div(class = "combo-row",
+                 checkboxInput(paste0("plot_", combo_id), df$label[i], value = i <= 3),
+                 checkboxInput(paste0("flag_", combo_id), NULL, value = isTRUE(flags[[combo_id]])),
+                 textInput(paste0("note_", combo_id), NULL, value = notes[[combo_id]] %||% "", placeholder = "Notes...")
+        )
+      })
+      do.call(tagList, rows)
     })
     
-    output$cast_type_ui <- renderUI({
-      types <- plot_df %>% filter(sample_id == input$sample_id) %>% pull(cast_type) %>% unique()
-      selectInput("cast_type", "Cast type", choices = c("Any", sort(na.omit(types))), selected = "Any")
-    })
-    output$fcomp_additive_ui <- renderUI({
-      adds <- plot_df %>% filter(sample_id == input$sample_id) %>% pull(fcomp_additive) %>% unique()
-      selectInput("fcomp_additive", "Additive", choices = c("Any", sort(na.omit(adds))), selected = "Any")
-    })
-    output$fcomp_salt_ui <- renderUI({
-      salts <- plot_df %>% filter(sample_id == input$sample_id) %>% pull(fcomp_salt) %>% unique()
-      selectInput("fcomp_salt", "Salt", choices = c("Any", sort(na.omit(salts))), selected = "Any")
-    })
-    output$fcomp_formulation_ui <- renderUI({
-      forms <- plot_df %>% filter(sample_id == input$sample_id) %>% pull(fcomp_formulation) %>% unique()
-      selectInput("fcomp_formulation", "Formulation", choices = c("Any", sort(na.omit(forms))), selected = "Any")
+    # Track flag changes
+    observe({
+      df <- combos_df()
+      flags <- isolate(rv_flags())
+      purrr::walk(df$id, function(id) {
+        val <- input[[paste0("flag_", id)]]
+        if (!is.null(val)) flags[[id]] <- val
+      })
+      rv_flags(flags)
     })
     
-    # Filtered data
-    filtered_df <- reactive({
-      apply_filters(
-        df = plot_df,
-        sample_id = input$sample_id,
-        pins = input$pin,
-        files = input$file_name,
-        cycles = input$cycle_index,
-        cast_type = input$cast_type,
-        fcomp_additive = input$fcomp_additive,
-        fcomp_salt = input$fcomp_salt,
-        fcomp_formulation = input$fcomp_formulation
+    # Track note changes
+    observe({
+      df <- combos_df()
+      notes <- isolate(rv_notes())
+      purrr::walk(df$id, function(id) {
+        val <- input[[paste0("note_", id)]]
+        if (!is.null(val)) notes[[id]] <- val
+      })
+      rv_notes(notes)
+    })
+    
+    parsed_combos <- reactive({
+      df <- combos_df()
+      selected <- purrr::keep(df$id, ~isTRUE(input[[paste0("plot_", .x)]]))
+      if (length(selected) == 0) {
+        return(tibble(pin = integer(), file_name = character(), cycle_index = integer())[0, ])
+      }
+      pieces <- strsplit(selected, "\\|\\|")
+      tibble(
+        pin         = as.integer(purrr::map_chr(pieces, 1)),
+        file_name   = purrr::map_chr(pieces, 2),
+        cycle_index = as.integer(purrr::map_chr(pieces, 3))
       )
     })
     
-    # Plot container
-    output$plots_container <- renderUI({
-      if (input$view_mode == "Individual plots") {
-        tagList(
-          plotlyOutput("nyquist_plot", width = "100%", height = plot_height()),
-          plotlyOutput("bode_mag_plot", width = "100%", height = plot_height()),
-          plotlyOutput("bode_phase_plot", width = "100%", height = plot_height()),
-          plotlyOutput("linkk_plot", width = "100%", height = plot_height())
-        )
+    filtered_df <- reactive({
+      req(input$sample_id)
+      sel <- parsed_combos()
+      if (nrow(sel) == 0) return(rv_fitdf()[0, ])
+      rv_fitdf() %>%
+        dplyr::filter(sample_id == input$sample_id) %>%
+        dplyr::inner_join(sel, by = c("pin", "file_name", "cycle_index"))
+    })
+    
+    # Plots
+    output$nyquist    <- renderPlotly(build_nyquist_plot(filtered_df(), input$palette_mode))
+    output$bode_mag   <- renderPlotly(build_bode_mag_plot(filtered_df(), input$palette_mode))
+    output$bode_phase <- renderPlotly(build_bode_phase_plot(filtered_df(), input$palette_mode))
+    output$linkk      <- renderPlotly(build_linkk_plot(filtered_df(), input$palette_mode))
+    
+    # Metrics
+    output$metrics_gt <- render_gt({
+      req(input$sample_id)
+      smp <- rv_combined()$samples[[input$sample_id]]
+      if (is.null(smp$eis_results)) return(gt(data.frame(Message = "No EIS")))
+      sel <- parsed_combos()
+      if (nrow(sel) == 0) return(gt(data.frame(Message = "No selection")))
+      metrics_list <- purrr::pmap(sel, function(pin, file_name, cycle_index) {
+        pe <- purrr::detect(smp$eis_results, ~(.x$pin %||% NA) == pin && (.x$file_name %||% "") == file_name)
+        if (is.null(pe)) return(NULL)
+        cycles <- purrr::keep(pe$cycle_data %||% list(), ~.x$cycle == cycle_index)
+        if (length(cycles) == 0) return(NULL)
+        list(label = sprintf("C%d | P%d", cycle_index, pin), metrics = extract_fit_metrics(cycles))
+      }) %>% purrr::compact()
+      build_fit_metrics_table(metrics_list)
+    })
+    
+    # Save progress into in-memory object
+    observeEvent(input$save_progress, {
+      flags    <- rv_flags()
+      notes    <- rv_notes()
+      combined <- rv_combined()
+      
+      purrr::iwalk(combined$samples, function(smp, sid) {
+        if (is.null(smp$eis_results)) return()
+        purrr::iwalk(smp$eis_results, function(pe, pk) {
+          purrr::iwalk(pe$cycle_data %||% list(), function(cyc, ci) {
+            id <- paste(pe$pin, pe$file_name, cyc$cycle, sep = "||")
+            combined$samples[[sid]]$eis_results[[pk]]$cycle_data[[ci]]$eis_flag <<- flags[[id]] %||% FALSE
+            combined$samples[[sid]]$eis_results[[pk]]$cycle_data[[ci]]$eis_note <<- notes[[id]] %||% ""
+          })
+        })
+      })
+      
+      rv_combined(combined)
+      assign("combined_eis_data", combined, envir = .GlobalEnv)
+      showNotification("Progress saved", type = "message")
+    })
+    
+    observeEvent(input$reload_from_env, {
+      if (exists("combined_eis_data", envir = .GlobalEnv)) {
+        new_combined <- get("combined_eis_data", envir = .GlobalEnv)
+        rv_combined(new_combined)
+        rv_fitdf(tidy_eis_data(new_combined))
+        updateSelectInput(session, "sample_id", choices = sort(unique(names(new_combined$samples))))
+        showNotification("Reloaded", type = "message")
       } else {
-        plotlyOutput("panel_plot", width = input$plot_width, height = plot_height() * 2)
+        showNotification("combined_eis_data not found", type = "warning")
       }
     })
-    
-    # Individual plots
-    output$nyquist_plot   <- renderPlotly({ build_nyquist_plot(filtered_df(), input$plot_width, plot_height(), input$overlay_pins, input$overlay_cycles) })
-    output$bode_mag_plot  <- renderPlotly({ build_bode_mag_plot(filtered_df(), input$plot_width, plot_height(), input$overlay_pins, input$overlay_cycles) })
-    output$bode_phase_plot<- renderPlotly({ build_bode_phase_plot(filtered_df(), input$plot_width, plot_height(), input$overlay_pins, input$overlay_cycles) })
-    output$linkk_plot     <- renderPlotly({ build_linkk_plot(filtered_df(), input$plot_width, plot_height(), input$overlay_pins, input$overlay_cycles) })
-    
-    # 2x2 panel
-    output$panel_plot <- renderPlotly({
-      build_panel_plot(filtered_df(), input$plot_width, plot_height(), input$overlay_pins, input$overlay_cycles, input$panel_selection)
-    })
-    
-    # Summary table
-    output$file_summary <- DT::renderDataTable({
-      build_file_summary_table(filtered_df())
-    }, options = list(pageLength = 10, searching = TRUE, lengthChange = FALSE))
-    
-    # Fit metrics table
-    output$fit_metrics <- DT::renderDataTable({
-      sample_entry <- json_data$samples[[input$sample_id]]
-      cycles <- list()
-      if (!is.null(sample_entry) && !is.null(sample_entry$eis_results)) {
-        eis <- sample_entry$eis_results
-        selected_pins <- if (!is.null(input$pin) && length(input$pin) > 0) input$pin else unique(plot_df$pin[plot_df$sample_id == input$sample_id])
-        selected_files <- if (!is.null(input$file_name) && length(input$file_name) > 0) input$file_name else NULL
-        selected_cycles <- if (!is.null(input$cycle_index) && length(input$cycle_index) > 0) input$cycle_index else NULL
-        
-        for (pk in names(eis)) {
-          pe <- eis[[pk]]
-          if (!is.null(pe$pin) && pe$pin %in% selected_pins) {
-            if (!is.null(selected_files) && length(selected_files) > 0 && !(pe$file_name %in% selected_files)) next
-            cds <- pe$cycle_data
-            if (!is.null(cds) && length(cds) > 0) {
-              if (!is.null(selected_cycles) && length(selected_cycles) > 0) {
-                cds <- Filter(function(cyc) cyc$cycle %in% selected_cycles, cds)
-              }
-              cycles <- c(cycles, cds)
-            }
-          }
-        }
-      }
-      metrics <- extract_fit_metrics(cycles)
-      build_fit_metrics_table(metrics)
-    }, options = list(pageLength = 10, searching = FALSE, lengthChange = FALSE))
   }
 }
 
-# -----------------------------
-# Bootstrap app
-# -----------------------------
+# =============================================================================
+# RUNNERS
+# =============================================================================
+# 1) Preferred: run the app from in-memory objects you loaded earlier
+run_eis_app <- function(json_data, plot_df) {
+  shinyApp(build_ui(plot_df, json_data), build_server(plot_df, json_data))
+}
 
-json_data <- load_json(json_path)
-plot_df <- tidy_eis_data(json_data)
-ui <- build_ui(plot_df)
-server <- build_server(plot_df, json_data)
-shinyApp(ui, server)
+# 2) Convenience wrapper that loads from disk if you still want a single call
+run_eis_viewer <- function(meta_path = NA_character_, eis_path = NA_character_) {
+  if (is.na(meta_path)) meta_path <- Sys.getenv("META_JSON", "")
+  if (is.na(eis_path))  eis_path  <- Sys.getenv("EIS_JSON", "")
+  
+  meta_json <- if (nzchar(meta_path)) load_meta_json(meta_path) else list(samples = list())
+  eis_json  <- if (nzchar(eis_path))  load_eis_json(eis_path)  else list()
+  
+  json_data <- combine_eis_meta(meta_json, eis_json)
+  plot_df   <- tidy_eis_data(json_data)
+  
+  shinyApp(build_ui(plot_df, json_data), build_server(plot_df, json_data))
+}
+
+# =============================================================================
+# Example usage for separated loading
+# =============================================================================
+meta_json <- load_meta_json("~/Git/SPOC_code/data/SPOC_battery.json")
+eis_json  <- load_eis_json("~/Git/SPOC_code/data/eis_autoprocess.json")
+json_data <- combine_eis_meta(meta_json, eis_json)
+plot_df   <- tidy_eis_data(json_data)
+run_eis_app(json_data, plot_df)
