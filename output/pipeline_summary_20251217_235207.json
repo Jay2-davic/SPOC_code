@@ -1,0 +1,58 @@
+{
+  "summary_stats": [
+    {
+      "metric": "Total samples",
+      "count": 6819,
+      "percentage": 100
+    },
+    {
+      "metric": "Bulk cast samples",
+      "count": 801,
+      "percentage": 11.7
+    },
+    {
+      "metric": "Coin cell samples",
+      "count": 1097,
+      "percentage": 16.1
+    },
+    {
+      "metric": "PCB print samples",
+      "count": 4817,
+      "percentage": 70.6
+    },
+    {
+      "metric": "coin cell samples",
+      "count": 96,
+      "percentage": 1.4
+    },
+    {
+      "metric": "none samples",
+      "count": 8,
+      "percentage": 0.1
+    },
+    {
+      "metric": "Flagged for removal",
+      "count": 6103,
+      "percentage": 89.5
+    }
+  ],
+  "ic_statistics": [
+    {
+      "metric": "Mean IC",
+      "value": 0.0022
+    },
+    {
+      "metric": "Median IC",
+      "value": 2.454e-06
+    },
+    {
+      "metric": "Min IC",
+      "value": 0
+    },
+    {
+      "metric": "Max IC",
+      "value": 2.4242
+    }
+  ],
+  "timestamp": "2025-12-17 23:52:07"
+}

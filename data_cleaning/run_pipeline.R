@@ -19,6 +19,7 @@ excel_dir   <- args[1]
 output_path <- args[2]
 
 # You can still hardcode these, or make them arguments if needed:
+# excel_dir <- "~/Git/SPOC_code/data/excel"
 mpr_cols <- c("eis_mpr", "x2eis_mpr", "x3eis_mpr", "x4eis_mpr")
 prefix   <- "General - High-Throughput Polymer Electrolytes DIW\\Database of polymer electrolytes\\"
 # --- 1. Load and Clean Excel Files ---

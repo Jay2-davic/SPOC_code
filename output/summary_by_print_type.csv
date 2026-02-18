@@ -1,0 +1,3 @@
+"print_type","n_samples","n_unique_samples","mean_IC","median_IC","sd_IC"
+"Coin cell",658,197,2.0395264506079e-06,1.7733e-06,2.05526230868591e-06
+"PCB print",2184,279,3.75689538434066e-06,3.79155e-06,2.17321268755991e-06

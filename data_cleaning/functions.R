@@ -288,16 +288,16 @@ rename_syringe_columns <- function(df) {
   set_map <- function(src, dst) if (src %in% nm) map[[src]] <<- dst
 
   # Materials primary and secondary for each syringe
-  set_map("material1a",     "syringe1_material")
-  set_map("material1a_mw",  "syringe1_material_mw")
-  set_map("material1a_rat", "syringe1_ratio")
+  set_map("material1a",     "syringe1_material1")
+  set_map("material1a_mw",  "syringe1_material1_mw")
+  set_map("material1a_rat", "syringe1_ratio1")
   set_map("material2a",     "syringe1_material2")
   set_map("material2a_mw",  "syringe1_material2_mw")
   set_map("material2a_rat", "syringe1_ratio2")
 
-  set_map("material1b",     "syringe2_material")
-  set_map("material1b_mw",  "syringe2_material_mw")
-  set_map("material1b_rat", "syringe2_ratio")
+  set_map("material1b",     "syringe2_material1")
+  set_map("material1b_mw",  "syringe2_material1_mw")
+  set_map("material1b_rat", "syringe2_ratio1")
   set_map("material2b",     "syringe2_material2")
   set_map("material2b_mw",  "syringe2_material2_mw")
   set_map("material2b_rat", "syringe2_ratio2")
@@ -408,16 +408,17 @@ rename_syringe_columns <- function(df) {
 #' @return data.frame with syringe1_material_1, syringe1_material_1_mw,
 #'   syringe1_material_1_ratio and equivalents for syringe2
 #' @export
+
 augment_syringe_material_1 <- function(df) {
   df %>%
     mutate(
-      syringe1_material_1 = coalesce(syringe1_material, NA_character_),
-      syringe1_material_1_mw = suppressWarnings(as.numeric(syringe1_material_mw)),
-      syringe1_material_1_ratio = suppressWarnings(as.numeric(syringe1_ratio)),
-      syringe2_material_1 = coalesce(syringe2_material, NA_character_),
-      syringe2_material_1_mw = suppressWarnings(as.numeric(syringe2_material_mw)),
-      syringe2_material_1_ratio = suppressWarnings(as.numeric(syringe2_ratio))
-    )
+      syringe1_material_1 = coalesce(syringe1_material1, NA_character_),
+      syringe1_material_1_mw = suppressWarnings(as.numeric(syringe1_material2_mw)),
+      syringe1_material_1_ratio = suppressWarnings(as.numeric(syringe1_ratio1)),
+      syringe2_material_1 = coalesce(syringe2_material1, NA_character_),
+      syringe2_material_1_mw = suppressWarnings(as.numeric(syringe2_material2_mw)),
+      syringe2_material_1_ratio = suppressWarnings(as.numeric(syringe2_ratio1))
+    ) 
 }
 
 # --- Ensure sample_ID column exists and is standardized ---
@@ -604,16 +605,21 @@ guess_numeric <- function(col, dfs, threshold = 0.8) {
   })
   mean(!is.na(nums)) >= threshold
 }
-# --- Feature engineering: fcomp calculation ---
 #' Finalize sample-level formulation fields
 #'
 #' - Builds fcomp_* fields from syringe fields
+#' - Uses material_1 columns (not base material columns)
 #' - Weighted percentages sum to NA when both contributors are NA
 #' - fcomp_formulation is omitted (NA) when inputs are missing
 #'
 #' @param df data.frame of cleaned, renamed syringe columns
 #' @return data.frame with fcomp_* fields added
 #' @export
+two_sig_figs <- function(x) {
+  a <- signif(x, digits = 3)
+  return(a)
+}
+
 finalize_samples <- function(df) {
   # weighted sum of two terms, returns NA if both terms are NA
   wsum2 <- function(a, b) {
@@ -623,38 +629,70 @@ finalize_samples <- function(df) {
     out
   }
   
-  # ratios
-  s1r <- suppressWarnings(as.numeric(df$syringe1_ratio))
-  s2r <- suppressWarnings(as.numeric(df$syringe2_ratio))
+  # Flow rates (used for weighted composition)
+  s1r <- suppressWarnings(as.numeric(df$syringe1_flow_rate))
+  s2r <- suppressWarnings(as.numeric(df$syringe2_flow_rate))
   
-  # component contributions
-  add1   <- s1r * suppressWarnings(as.numeric(df$syringe1_additive_wt_pct))
-  add2   <- s2r * suppressWarnings(as.numeric(df$syringe2_additive_wt_pct))
-  salt1  <- s1r * suppressWarnings(as.numeric(df$syringe1_salt_wt_pct))
-  salt2  <- s2r * suppressWarnings(as.numeric(df$syringe2_salt_wt_pct))
-  inhib1 <- s1r * suppressWarnings(as.numeric(df$syringe1_inhibitor_wt_pct))
-  inhib2 <- s2r * suppressWarnings(as.numeric(df$syringe2_inhibitor_wt_pct))
-  init1  <- s1r * suppressWarnings(as.numeric(df$syringe1_wt_initiator))
-  init2  <- s2r * suppressWarnings(as.numeric(df$syringe2_wt_initiator))
+  # Material ratios within each syringe
+  m1r1 <- suppressWarnings(as.numeric(df$syringe1_ratio1))
+  m1r2 <- suppressWarnings(as.numeric(df$syringe1_ratio2))  # secondary material in syringe1
+  m2r1 <- suppressWarnings(as.numeric(df$syringe2_ratio1))
+  m2r2 <- suppressWarnings(as.numeric(df$syringe2_ratio2))  # secondary material in syringe2
+  
+  # Normalize flow rates to fractions (handle NA case)
+  total_flow <- s1r + s2r
+  s1_frac <- ifelse(is.na(total_flow) | total_flow == 0, NA_real_, s1r / total_flow)
+  s2_frac <- ifelse(is.na(total_flow) | total_flow == 0, NA_real_, s2r / total_flow)
+  
+  # component contributions (weighted by flow rate)
+  add1   <- s1_frac * suppressWarnings(as.numeric(df$syringe1_additive_wt_pct))
+  add2   <- s2_frac * suppressWarnings(as.numeric(df$syringe2_additive_wt_pct))
+  salt1  <- s1_frac * suppressWarnings(as.numeric(df$syringe1_salt_wt_pct))
+  salt2  <- s2_frac * suppressWarnings(as.numeric(df$syringe2_salt_wt_pct))
+  inhib1 <- s1_frac * suppressWarnings(as.numeric(df$syringe1_inhibitor_wt_pct))
+  inhib2 <- s2_frac * suppressWarnings(as.numeric(df$syringe2_inhibitor_wt_pct))
+  init1  <- s1_frac * suppressWarnings(as.numeric(df$syringe1_wt_initiator))
+  init2  <- s2_frac * suppressWarnings(as.numeric(df$syringe2_wt_initiator))
   
   df %>%
     mutate(
-      fcomp_mat1 = syringe1_material,
-      fcomp_mat2 = syringe2_material,
-      fcomp_mat1_ratio = s1r,
-      fcomp_mat2_ratio = s2r,
+      # Primary materials from each syringe
+      fcomp_mat1 = syringe1_material_1,
+      fcomp_mat2 = syringe2_material2,
+      
+      # Material ratios: weighted by flow rate
+      # If both syringes contribute the same material, this sums their contributions
+      fcomp_mat1_ratio = (m1r1 + m2r1) /2 |> two_sig_figs(),
+      fcomp_mat2_ratio = (m1r2 + m2r2) /2 |> two_sig_figs(),
       
       fcomp_additive        = coalesce(syringe1_additive, syringe2_additive),
-      fcomp_additive_wt_pct = wsum2(add1, add2),
-      
+      fcomp_additive        = dplyr::case_when(
+        stringr::str_detect(fcomp_additive, "Cab-O-Sil EH%") == TRUE ~ "EH5",
+        stringr::str_detect(fcomp_additive, "Aerosil 90") == TRUE ~ "AE90",
+        stringr::str_detect(fcomp_additive, "Aerosil 380") == TRUE ~ "AE380",
+        stringr::str_detect(fcomp_additive, "Al2O3|AlO3") == TRUE ~ "Al\u2082O\u2083",
+        stringr::str_detect(fcomp_additive, "TiO\u2082") == TRUE ~ "TiO2",
+        stringr::str_detect(fcomp_additive, "PEO [(]100,000 MW[)]") == TRUE ~ "PEO100K",
+        TRUE ~ fcomp_additive
+      ),
+      fcomp_additive_wt_pct = wsum2(add1, add2) |> two_sig_figs(),
+      fcomp_additive_wt_pct =
+                      # correction for close numbers
+                      dplyr::case_when(
+                        fcomp_additive_wt_pct == 4.28 ~ 4.29,
+                        fcomp_additive_wt_pct == 6.43 ~ 6.42,
+                        fcomp_additive_wt_pct == 8.56 ~ 8.57,
+                        fcomp_additive_wt_pct == 12.8 ~ 12.9,
+                        TRUE ~ fcomp_additive_wt_pct
+      ),
       fcomp_salt        = coalesce(syringe1_salt, syringe2_salt),
-      fcomp_salt_wt_pct = wsum2(salt1, salt2),
+      fcomp_salt_wt_pct = wsum2(salt1, salt2) |> two_sig_figs(),
       
-      fcomp_inhibitor        = coalesce(syringe1_inhibitor, syringe2_inhibitor),
-      fcomp_inhibitor_wt_pct = wsum2(inhib1, inhib2),
+      # fcomp_inhibitor        = coalesce(syringe1_inhibitor, syringe2_inhibitor),
+      # fcomp_inhibitor_wt_pct = wsum2(inhib1, inhib2),
       
-      initiator    = coalesce(syringe1_initiator, syringe2_initiator),
-      wt_initiator = wsum2(init1, init2)
+      fcomp_initiator    = coalesce(syringe1_initiator, syringe2_initiator),
+      fcomp_initiator_wt_pct = wsum2(init1, init2) |> two_sig_figs()
     ) %>%
     mutate(
       # Build the formulation string row by row with scalar-style logic
